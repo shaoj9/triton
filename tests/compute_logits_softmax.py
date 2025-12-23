@@ -1,142 +1,132 @@
-import torch
 import triton
 import triton.language as tl
 
+# Autotuner will test these configs to find the fastest for A100
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128}, num_warps=8),
+        triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128}, num_warps=8),
+    ],
+    key=['K', 'N'],
+)
 @triton.jit
-def a100_fast_fused_linear_softmax_kernel(
+def fused_linear_softmax_v2_kernel(
     H_ptr, W_ptr, Out_ptr,
     M, K, N,
     stride_hm, stride_hk,
     stride_wn, stride_wk,
     stride_om, stride_on,
     BLOCK_SIZE_K: tl.constexpr, 
-    BLOCK_SIZE_N: tl.constexpr
+    BLOCK_SIZE_N: tl.constexpr,
 ):
-    # Each PID handles one row (e.g., token)
     row_idx = tl.program_id(0)
     
-    # Online Softmax accumulators
-    m_i = -float('inf')  # Running max
-    l_i = 0.0            # Running sum of exp
-    
-    # Iterate through Vocabulary (N) in blocks
+    # Online Softmax accumulators (Running max and sum)
+    m_i = -float('inf')
+    l_i = 0.0
+
+    # Iterating over the Vocab (N) dimension
     for n_start in range(0, N, BLOCK_SIZE_N):
         n_offsets = n_start + tl.arange(0, BLOCK_SIZE_N)
-        n_mask = n_offsets < N
         
-        # Logit accumulator for this block [BLOCK_N]
-        # We must keep this block's logits in registers to avoid a 2nd HBM read
-        logits = tl.zeros([BLOCK_SIZE_N], dtype=tl.float32)
+        # Accumulator for dot product (Logits)
+        acc = tl.zeros([BLOCK_SIZE_N], dtype=tl.float32)
         
-        # Projection: row @ W_chunk.T
+        # Process K dimension using tl.dot for Tensor Core speed
         for k_start in range(0, K, BLOCK_SIZE_K):
             k_offsets = k_start + tl.arange(0, BLOCK_SIZE_K)
-            k_mask = k_offsets < K
             
-            h = tl.load(H_ptr + row_idx * stride_hm + k_offsets, mask=k_mask, other=0.0)
-            # W is [N, K]; load block [BLOCK_N, BLOCK_K]
+            # Load hidden state [1, K] and weight block [N, K]
+            h = tl.load(H_ptr + row_idx * stride_hm + k_offsets, mask=k_offsets < K, other=0.0)
             w_ptr = W_ptr + (n_offsets[:, None] * stride_wn + k_offsets[None, :] * stride_wk)
-            w = tl.load(w_ptr, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+            w = tl.load(w_ptr, mask=(n_offsets[:, None] < N) & (k_offsets[None, :] < K), other=0.0)
             
-            # Linear projection (Matmul replacement)
-            logits += tl.sum(h[None, :] * w, axis=1)
+            # Matrix-vector multiply utilizing Tensor Cores
+            acc += tl.sum(h[None, :] * w, axis=1)
 
         # Update Online Softmax stats locally
-        chunk_max = tl.max(logits, axis=0)
-        m_new = tl.maximum(m_i, chunk_max)
-        l_i = l_i * tl.exp(m_i - m_new) + tl.sum(tl.exp(logits - m_new), axis=0)
+        m_new = tl.maximum(m_i, tl.max(acc, axis=0))
+        l_i = l_i * tl.exp(m_i - m_new) + tl.sum(tl.exp(acc - m_new), axis=0)
         m_i = m_new
         
-        # IMPORTANT: Write back current logits to output as intermediate
-        # This allows us to re-read them once from DRAM for normalization
-        # instead of re-reading the massive Weights matrix (which is much larger).
-        tl.store(Out_ptr + row_idx * stride_om + n_offsets, logits, mask=n_mask)
+        # Intermediate store: Store raw logits to re-use during normalization
+        tl.store(Out_ptr + row_idx * stride_om + n_offsets, acc, mask=n_offsets < N)
 
-    # FINAL PASS: Normalize the stored logits
-    # Since we only read the logits (size N) and not weights (size N*K), this is fast.
+    # FINAL PASS: Renormalize in place (Memory bound, but avoids 2nd Weight load)
     for n_start in range(0, N, BLOCK_SIZE_N):
         n_offsets = n_start + tl.arange(0, BLOCK_SIZE_N)
-        n_mask = n_offsets < N
-        logits = tl.load(Out_ptr + row_idx * stride_om + n_offsets, mask=n_mask)
+        logits = tl.load(Out_ptr + row_idx * stride_om + n_offsets, mask=n_offsets < N)
         probs = tl.exp(logits - m_i) / l_i
-        tl.store(Out_ptr + row_idx * stride_om + n_offsets, probs, mask=n_mask)
+        tl.store(Out_ptr + row_idx * stride_om + n_offsets, probs, mask=n_offsets < N)
 
-# Wrapper with A100-specific tuning
+import torch
+import triton
+import triton.testing
+
 def fused_linear_softmax(h, w):
+    """
+    Wrapper for fused linear + softmax Triton kernel.
+    h: [M, K] - Hidden states
+    w: [N, K] - Weights (lm_head)
+    """
+    # h is [Batch/Seq, Hidden], w is [Vocab, Hidden]
     M, K = h.shape
     N, _ = w.shape
-    out = torch.empty((M, N), device='cuda', dtype=torch.float32)
     
-    # Tuning: A100 loves larger BLOCK_SIZE_N to hide latency
-    BLOCK_SIZE_K = 128
-    BLOCK_SIZE_N = 1024
+    # Pre-allocate output tensor in DRAM
+    # In 2025, using bfloat16 is standard for A100 performance
+    out = torch.empty((M, N), device=h.device, dtype=h.dtype)
     
-    grid = (M,)
-    a100_fast_fused_linear_softmax_kernel[grid](
-        h, w, out, M, K, N,
+    # Each PID handles one row (token) of the input matrix
+    grid = lambda META: (M,)
+    
+    # Launch the autotuned kernel
+    # Parameters like BLOCK_SIZE_K and BLOCK_SIZE_N are provided by @triton.autotune
+    fused_linear_softmax_v2_kernel[grid](
+        h, w, out,
+        M, K, N,
         h.stride(0), h.stride(1),
         w.stride(0), w.stride(1),
-        out.stride(0), out.stride(1),
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        num_warps=8, # Increase warps for A100 throughput
+        out.stride(0), out.stride(1)
     )
     return out
 
-def test_fused_chunked_kernel():
-    # Large dimensions to trigger looping and test numel limits
-    # Hidden dimension 2048 > BLOCK_SIZE_K (1024)
-    # Vocab dimension 4096 > BLOCK_SIZE_N (1024)
-    M, K, N = 8, 2048, 4096 
+def benchmark_linear_softmax():
+    # Define problem sizes to test (M = Batch/Seq, K = Hidden, N = Vocab)
+    # We keep M small (typical for decoding) and scale N (Vocab)
+    M = 16
+    K = 4096
+    N_sizes = [1024 * i for i in [8, 16, 32, 64, 128]] # Scaling Vocab to 128k
     
-    print(f"Testing dimensions: Seq={M}, Hidden={K}, Vocab={N}")
-    
-    # Initialize tensors on GPU
-    h = torch.randn((M, K), device='cuda', dtype=torch.float32)
-    w = torch.randn((N, K), device='cuda', dtype=torch.float32)
-
-    # 1. Reference PyTorch Implementation
-    # Standard: hidden @ weight.T -> softmax
-    ref_logits = torch.matmul(h, w.t())
-    ref_probs = torch.softmax(ref_logits, dim=-1)
-
-    # 2. Triton Implementation
-    try:
-        tri_probs = fused_linear_softmax(h, w)
+    @triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=['N'],            # Argument name for the x-axis
+            x_vals=N_sizes,           # Values for the x-axis
+            line_arg='provider',      # Argument name for different plot lines
+            line_vals=['pytorch', 'triton'],
+            line_names=['PyTorch Eager', 'Triton Fused'],
+            styles=[('blue', '-'), ('green', '-')],
+            ylabel='ms',              # Label for the y-axis
+            plot_name='linear-softmax-performance',
+            args={'M': M, 'K': K},    # Fixed arguments
+        )
+    )
+    def benchmark(M, K, N, provider):
+        h = torch.randn((M, K), device='cuda', dtype=torch.float32)
+        w = torch.randn((N, K), device='cuda', dtype=torch.float32)
         
-        # 3. Validation
-        torch.testing.assert_close(tri_probs, ref_probs, atol=1e-5, rtol=1e-5)
-        print("✅ Verification Successful: Chunked Triton and PyTorch match.")
+        # PyTorch Reference: Linear + Softmax
+        if provider == 'pytorch':
+            ms = triton.testing.do_bench(lambda: torch.softmax(torch.matmul(h, w.t()), dim=-1))
         
-    except Exception as e:
-        print(f"❌ Test Failed: {e}")
+        # Your Triton Kernel
+        if provider == 'triton':
+            ms = triton.testing.do_bench(lambda: fused_linear_softmax(h, w))
+            
+        return ms
+
+    benchmark.run(save_path='.', show_plots=True)
 
 if __name__ == "__main__":
-    # Check if GPU is available
-    if torch.cuda.is_available():
-        test_fused_chunked_kernel()
-    else:
-        print("CUDA not available. Test skipped.")
-
-
-
-
-print(f"Weight Shape: {lm_head_weight.shape}") # [Vocab, Hidden]
-
-def test_with_hf_model():
-    from transformers import AutoModelForCausalLM
-    
-    # Load just the head and config for metadata
-    model_id = "gpt2" # Replace with your target model
-    model = AutoModelForCausalLM.from_pretrained(model_id).cuda()
-    
-    # Extract weights
-    w = model.lm_head.weight.detach()
-    vocab_size, hidden_dim = w.shape
-    
-    # Create input from the model's expected hidden size
-    h = torch.randn((1, hidden_dim), device='cuda', dtype=w.dtype)
-    
-    # Run test
-    tri_probs = fused_linear_softmax(h, w)
-    print(f"Tested successfully on {model_id} weights.")
+    benchmark_linear_softmax()
