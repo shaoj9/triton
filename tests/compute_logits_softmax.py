@@ -9,60 +9,73 @@ def fused_linear_softmax_kernel(
     stride_hm, stride_hk,
     stride_wn, stride_wk,
     stride_om, stride_on,
-    BLOCK_SIZE_K: tl.constexpr, # Smaller block for Hidden dim
-    BLOCK_SIZE_N: tl.constexpr  # Smaller block for Vocab dim
+    BLOCK_SIZE_K: tl.constexpr, 
+    BLOCK_SIZE_N: tl.constexpr  
 ):
+    # Each program handles one row (token) in the batch/sequence
     row_idx = tl.program_id(0)
     
-    # Online Softmax accumulators
-    m_i = -float('inf')
-    l_i = 0.0
+    # --- PASS 1: COMPUTE LOGITS & ONLINE SOFTMAX STATS ---
+    m_i = -float('inf')  # Running max
+    l_i = 0.0            # Running sum of exponentials
 
-    # Pass 1: Compute logits and update max/sum in chunks
     for n_start in range(0, N, BLOCK_SIZE_N):
         n_offsets = n_start + tl.arange(0, BLOCK_SIZE_N)
         n_mask = n_offsets < N
         
-        # Compute logit for this chunk (dot product h @ W_chunk^T)
-        acc = tl.zeros([BLOCK_SIZE_N], dtype=tl.float32)
+        # Initialize logit accumulator for this chunk
+        logits = tl.zeros([BLOCK_SIZE_N], dtype=tl.float32)
+        
+        # Chunked Dot Product (H_row @ W_chunk^T)
         for k_start in range(0, K, BLOCK_SIZE_K):
             k_offsets = k_start + tl.arange(0, BLOCK_SIZE_K)
             k_mask = k_offsets < K
             
+            # Load hidden state chunk and weight chunk
             h = tl.load(H_ptr + row_idx * stride_hm + k_offsets, mask=k_mask, other=0.0)
-            w = tl.load(W_ptr + n_offsets[:, None] * stride_wn + k_offsets[None, :] * stride_wk, 
-                        mask=n_mask[:, None] & k_mask[None, :], other=0.0)
-            acc += tl.sum(h[None, :] * w, axis=1)
+            # W is [N, K], we load a [BLOCK_N, BLOCK_K] slice
+            w_ptr = W_ptr + (n_offsets[:, None] * stride_wn + k_offsets[None, :] * stride_wk)
+            w = tl.load(w_ptr, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+            
+            # Multiply-accumulate
+            logits += tl.sum(h[None, :] * w, axis=1)
 
-        # Update online softmax stats for this chunk
-        chunk_max = tl.max(acc, axis=0)
+        # Online Softmax Update
+        chunk_max = tl.max(logits, axis=0)
         m_new = tl.maximum(m_i, chunk_max)
-        l_i = l_i * tl.exp(m_i - m_new) + tl.sum(tl.exp(acc - m_new), axis=0)
+        # Update sum of exps: l_prev * exp(m_prev - m_new) + sum(exp(logits - m_new))
+        l_i = l_i * tl.exp(m_i - m_new) + tl.sum(tl.exp(logits - m_new), axis=0)
         m_i = m_new
-    
-    # Pass 2: Final normalization and store
-    for n_start in range(0, N, BLOCK_SIZE):
-        n_offsets = n_start + tl.arange(0, BLOCK_SIZE)
+
+    # --- PASS 2: NORMALIZE AND STORE ---
+    # We must re-compute logits because they were not stored to save SRAM
+    for n_start in range(0, N, BLOCK_SIZE_N):
+        n_offsets = n_start + tl.arange(0, BLOCK_SIZE_N)
         n_mask = n_offsets < N
         
-        # Re-compute logits for storage (or store in SRAM if memory allows)
-        w_ptr = W_ptr + (n_offsets[:, None] * stride_wn + k_offsets[None, :] * stride_wk)
-        w_block = tl.load(w_ptr, mask=(n_mask[:, None] & (k_offsets[None, :] < K)), other=0.0)
-        logits = tl.sum(w_block * h_row[None, :], axis=1)
-        
-        # Normalize and store
+        logits = tl.zeros([BLOCK_SIZE_N], dtype=tl.float32)
+        for k_start in range(0, K, BLOCK_SIZE_K):
+            k_offsets = k_start + tl.arange(0, BLOCK_SIZE_K)
+            k_mask = k_offsets < K
+            h = tl.load(H_ptr + row_idx * stride_hm + k_offsets, mask=k_mask, other=0.0)
+            w_ptr = W_ptr + (n_offsets[:, None] * stride_wn + k_offsets[None, :] * stride_wk)
+            w = tl.load(w_ptr, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+            logits += tl.sum(h[None, :] * w, axis=1)
+            
+        # Final Softmax: exp(x - max) / sum_exp
         probs = tl.exp(logits - m_i) / l_i
         tl.store(Out_ptr + row_idx * stride_om + n_offsets, probs, mask=n_mask)
 
+# --- PYTHON WRAPPER ---
 def fused_linear_softmax(h, w):
     M, K = h.shape
-    N, _ = w.shape  # w is [Vocab, Hidden]
+    N, _ = w.shape
     out = torch.empty((M, N), device=h.device, dtype=h.dtype)
     
-    # Set block sizes below the 1048576 (2^20) limit
-    # 1024 * 1024 = 1,048,576. We use 1024 to stay safe with shared memory.
-    BLOCK_SIZE_K = 1024 
-    BLOCK_SIZE_N = 1024 
+    # 1024 is a safe block size for most modern GPUs (SRAM limits)
+    # This prevents the 'numel' error by ensuring no tl.arange is > 1048576
+    BLOCK_SIZE_K = 1024
+    BLOCK_SIZE_N = 1024
 
     grid = (M,)
     fused_linear_softmax_kernel[grid](
