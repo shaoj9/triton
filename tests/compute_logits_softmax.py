@@ -3,78 +3,83 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def fast_fused_linear_softmax_kernel(
+def a100_fast_fused_linear_softmax_kernel(
     H_ptr, W_ptr, Out_ptr,
     M, K, N,
     stride_hm, stride_hk,
     stride_wn, stride_wk,
     stride_om, stride_on,
     BLOCK_SIZE_K: tl.constexpr, 
-    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr
 ):
+    # Each PID handles one row (e.g., token)
     row_idx = tl.program_id(0)
     
     # Online Softmax accumulators
-    m_i = -float('inf')
-    l_i = 0.0
-
-    # Pass 1: Fast Logit Computation + Online Softmax
+    m_i = -float('inf')  # Running max
+    l_i = 0.0            # Running sum of exp
+    
+    # Iterate through Vocabulary (N) in blocks
     for n_start in range(0, N, BLOCK_SIZE_N):
         n_offsets = n_start + tl.arange(0, BLOCK_SIZE_N)
+        n_mask = n_offsets < N
         
-        # Accumulate dot product for this block using Tensor Cores
+        # Logit accumulator for this block [BLOCK_N]
+        # We must keep this block's logits in registers to avoid a 2nd HBM read
         logits = tl.zeros([BLOCK_SIZE_N], dtype=tl.float32)
+        
+        # Projection: row @ W_chunk.T
         for k_start in range(0, K, BLOCK_SIZE_K):
             k_offsets = k_start + tl.arange(0, BLOCK_SIZE_K)
+            k_mask = k_offsets < K
             
-            h = tl.load(H_ptr + row_idx * stride_hm + k_offsets, mask=k_offsets < K, other=0.0)
-            # Reshape h to [1, K] for tl.dot
-            w = tl.load(W_ptr + n_offsets[:, None] * stride_wn + k_offsets[None, :] * stride_wk, 
-                        mask=(n_offsets[:, None] < N) & (k_offsets[None, :] < K), other=0.0)
+            h = tl.load(H_ptr + row_idx * stride_hm + k_offsets, mask=k_mask, other=0.0)
+            # W is [N, K]; load block [BLOCK_N, BLOCK_K]
+            w_ptr = W_ptr + (n_offsets[:, None] * stride_wn + k_offsets[None, :] * stride_wk)
+            w = tl.load(w_ptr, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
             
-            # Using tl.dot is much faster than manual summation loops
+            # Linear projection (Matmul replacement)
             logits += tl.sum(h[None, :] * w, axis=1)
 
-        # Update online softmax statistics
+        # Update Online Softmax stats locally
         chunk_max = tl.max(logits, axis=0)
         m_new = tl.maximum(m_i, chunk_max)
         l_i = l_i * tl.exp(m_i - m_new) + tl.sum(tl.exp(logits - m_new), axis=0)
         m_i = m_new
+        
+        # IMPORTANT: Write back current logits to output as intermediate
+        # This allows us to re-read them once from DRAM for normalization
+        # instead of re-reading the massive Weights matrix (which is much larger).
+        tl.store(Out_ptr + row_idx * stride_om + n_offsets, logits, mask=n_mask)
 
-    # Pass 2: Final normalization and store
+    # FINAL PASS: Normalize the stored logits
+    # Since we only read the logits (size N) and not weights (size N*K), this is fast.
     for n_start in range(0, N, BLOCK_SIZE_N):
         n_offsets = n_start + tl.arange(0, BLOCK_SIZE_N)
-        logits = tl.zeros([BLOCK_SIZE_N], dtype=tl.float32)
-        for k_start in range(0, K, BLOCK_SIZE_K):
-            k_offsets = k_start + tl.arange(0, BLOCK_SIZE_K)
-            h = tl.load(H_ptr + row_idx * stride_hm + k_offsets, mask=k_offsets < K, other=0.0)
-            w = tl.load(W_ptr + n_offsets[:, None] * stride_wn + k_offsets[None, :] * stride_wk, 
-                        mask=(n_offsets[:, None] < N) & (k_offsets[None, :] < K), other=0.0)
-            logits += tl.sum(h[None, :] * w, axis=1)
-            
+        n_mask = n_offsets < N
+        logits = tl.load(Out_ptr + row_idx * stride_om + n_offsets, mask=n_mask)
         probs = tl.exp(logits - m_i) / l_i
-        tl.store(Out_ptr + row_idx * stride_om + n_offsets, probs, mask=n_offsets < N)
+        tl.store(Out_ptr + row_idx * stride_om + n_offsets, probs, mask=n_mask)
 
-# --- PYTHON WRAPPER ---
+# Wrapper with A100-specific tuning
 def fused_linear_softmax(h, w):
     M, K = h.shape
     N, _ = w.shape
-    out = torch.empty((M, N), device=h.device, dtype=h.dtype)
+    out = torch.empty((M, N), device='cuda', dtype=torch.float32)
     
-    # 1024 is a safe block size for most modern GPUs (SRAM limits)
-    # This prevents the 'numel' error by ensuring no tl.arange is > 1048576
-    BLOCK_SIZE_K = 1024
+    # Tuning: A100 loves larger BLOCK_SIZE_N to hide latency
+    BLOCK_SIZE_K = 128
     BLOCK_SIZE_N = 1024
-
+    
     grid = (M,)
-    fast_fused_linear_softmax_kernel[grid](
-        h, w, out,
-        M, K, N,
+    a100_fast_fused_linear_softmax_kernel[grid](
+        h, w, out, M, K, N,
         h.stride(0), h.stride(1),
         w.stride(0), w.stride(1),
         out.stride(0), out.stride(1),
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
+        num_warps=8, # Increase warps for A100 throughput
     )
     return out
 
