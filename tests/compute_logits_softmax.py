@@ -23,22 +23,26 @@ def fused_linear_softmax_kernel(
     m_i = -float('inf')  # Running max
     l_i = 0.0            # Running sum of exp
     
-    # Pass 1: Compute logits and update max/sum accumulators
-    for n_start in range(0, N, BLOCK_SIZE):
-        n_offsets = n_start + tl.arange(0, BLOCK_SIZE)
+    # Pass 1: Compute logits and update max/sum in chunks
+    for n_start in range(0, N, BLOCK_SIZE_N):
+        n_offsets = n_start + tl.arange(0, BLOCK_SIZE_N)
         n_mask = n_offsets < N
         
-        # Compute logits for this block: Logit = sum(h_i * w_i)
-        # In a real kernel, this is tiled GEMM logic; here simplified for 1D row
-        w_ptr = W_ptr + (n_offsets[:, None] * stride_wn + k_offsets[None, :] * stride_wk)
-        w_block = tl.load(w_ptr, mask=(n_mask[:, None] & (k_offsets[None, :] < K)), other=0.0)
-        
-        # [BLOCK_SIZE, K] @ [K] -> [BLOCK_SIZE]
-        logits = tl.sum(w_block * h_row[None, :], axis=1)
-        
-        # Update online softmax statistics
-        m_new = tl.maximum(m_i, tl.max(logits, axis=0))
-        l_i = l_i * tl.exp(m_i - m_new) + tl.sum(tl.exp(logits - m_new), axis=0)
+        # Compute logit for this chunk (dot product h @ W_chunk^T)
+        acc = tl.zeros([BLOCK_SIZE_N], dtype=tl.float32)
+        for k_start in range(0, K, BLOCK_SIZE_K):
+            k_offsets = k_start + tl.arange(0, BLOCK_SIZE_K)
+            k_mask = k_offsets < K
+            
+            h = tl.load(H_ptr + row_idx * stride_hm + k_offsets, mask=k_mask, other=0.0)
+            w = tl.load(W_ptr + n_offsets[:, None] * stride_wn + k_offsets[None, :] * stride_wk, 
+                        mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+            acc += tl.sum(h[None, :] * w, axis=1)
+
+        # Update online softmax stats for this chunk
+        chunk_max = tl.max(acc, axis=0)
+        m_new = tl.maximum(m_i, chunk_max)
+        l_i = l_i * tl.exp(m_i - m_new) + tl.sum(tl.exp(acc - m_new), axis=0)
         m_i = m_new
 
     # Pass 2: Final normalization and store
