@@ -3,68 +3,57 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def fused_linear_softmax_kernel(
+def fast_fused_linear_softmax_kernel(
     H_ptr, W_ptr, Out_ptr,
     M, K, N,
     stride_hm, stride_hk,
     stride_wn, stride_wk,
     stride_om, stride_on,
     BLOCK_SIZE_K: tl.constexpr, 
-    BLOCK_SIZE_N: tl.constexpr  
+    BLOCK_SIZE_N: tl.constexpr,
 ):
-    # Each program handles one row (token) in the batch/sequence
     row_idx = tl.program_id(0)
     
-    # --- PASS 1: COMPUTE LOGITS & ONLINE SOFTMAX STATS ---
-    m_i = -float('inf')  # Running max
-    l_i = 0.0            # Running sum of exponentials
+    # Online Softmax accumulators
+    m_i = -float('inf')
+    l_i = 0.0
 
+    # Pass 1: Fast Logit Computation + Online Softmax
     for n_start in range(0, N, BLOCK_SIZE_N):
         n_offsets = n_start + tl.arange(0, BLOCK_SIZE_N)
-        n_mask = n_offsets < N
         
-        # Initialize logit accumulator for this chunk
+        # Accumulate dot product for this block using Tensor Cores
         logits = tl.zeros([BLOCK_SIZE_N], dtype=tl.float32)
-        
-        # Chunked Dot Product (H_row @ W_chunk^T)
         for k_start in range(0, K, BLOCK_SIZE_K):
             k_offsets = k_start + tl.arange(0, BLOCK_SIZE_K)
-            k_mask = k_offsets < K
             
-            # Load hidden state chunk and weight chunk
-            h = tl.load(H_ptr + row_idx * stride_hm + k_offsets, mask=k_mask, other=0.0)
-            # W is [N, K], we load a [BLOCK_N, BLOCK_K] slice
-            w_ptr = W_ptr + (n_offsets[:, None] * stride_wn + k_offsets[None, :] * stride_wk)
-            w = tl.load(w_ptr, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+            h = tl.load(H_ptr + row_idx * stride_hm + k_offsets, mask=k_offsets < K, other=0.0)
+            # Reshape h to [1, K] for tl.dot
+            w = tl.load(W_ptr + n_offsets[:, None] * stride_wn + k_offsets[None, :] * stride_wk, 
+                        mask=(n_offsets[:, None] < N) & (k_offsets[None, :] < K), other=0.0)
             
-            # Multiply-accumulate
+            # Using tl.dot is much faster than manual summation loops
             logits += tl.sum(h[None, :] * w, axis=1)
 
-        # Online Softmax Update
+        # Update online softmax statistics
         chunk_max = tl.max(logits, axis=0)
         m_new = tl.maximum(m_i, chunk_max)
-        # Update sum of exps: l_prev * exp(m_prev - m_new) + sum(exp(logits - m_new))
         l_i = l_i * tl.exp(m_i - m_new) + tl.sum(tl.exp(logits - m_new), axis=0)
         m_i = m_new
 
-    # --- PASS 2: NORMALIZE AND STORE ---
-    # We must re-compute logits because they were not stored to save SRAM
+    # Pass 2: Final normalization and store
     for n_start in range(0, N, BLOCK_SIZE_N):
         n_offsets = n_start + tl.arange(0, BLOCK_SIZE_N)
-        n_mask = n_offsets < N
-        
         logits = tl.zeros([BLOCK_SIZE_N], dtype=tl.float32)
         for k_start in range(0, K, BLOCK_SIZE_K):
             k_offsets = k_start + tl.arange(0, BLOCK_SIZE_K)
-            k_mask = k_offsets < K
-            h = tl.load(H_ptr + row_idx * stride_hm + k_offsets, mask=k_mask, other=0.0)
-            w_ptr = W_ptr + (n_offsets[:, None] * stride_wn + k_offsets[None, :] * stride_wk)
-            w = tl.load(w_ptr, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+            h = tl.load(H_ptr + row_idx * stride_hm + k_offsets, mask=k_offsets < K, other=0.0)
+            w = tl.load(W_ptr + n_offsets[:, None] * stride_wn + k_offsets[None, :] * stride_wk, 
+                        mask=(n_offsets[:, None] < N) & (k_offsets[None, :] < K), other=0.0)
             logits += tl.sum(h[None, :] * w, axis=1)
             
-        # Final Softmax: exp(x - max) / sum_exp
         probs = tl.exp(logits - m_i) / l_i
-        tl.store(Out_ptr + row_idx * stride_om + n_offsets, probs, mask=n_mask)
+        tl.store(Out_ptr + row_idx * stride_om + n_offsets, probs, mask=n_offsets < N)
 
 # --- PYTHON WRAPPER ---
 def fused_linear_softmax(h, w):
@@ -78,7 +67,7 @@ def fused_linear_softmax(h, w):
     BLOCK_SIZE_N = 1024
 
     grid = (M,)
-    fused_linear_softmax_kernel[grid](
+    fast_fused_linear_softmax_kernel[grid](
         h, w, out,
         M, K, N,
         h.stride(0), h.stride(1),
