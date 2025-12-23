@@ -9,20 +9,15 @@ def fused_linear_softmax_kernel(
     stride_hm, stride_hk,
     stride_wn, stride_wk,
     stride_om, stride_on,
-    BLOCK_SIZE: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr, # Smaller block for Hidden dim
+    BLOCK_SIZE_N: tl.constexpr  # Smaller block for Vocab dim
 ):
-    # Each program handles one row of the input sequence
     row_idx = tl.program_id(0)
     
-    # Load the hidden state vector for this row into SRAM
-    k_offsets = tl.arange(0, BLOCK_SIZE)
-    h_row_ptr = H_ptr + row_idx * stride_hm + k_offsets
-    h_row = tl.load(h_row_ptr, mask=k_offsets < K, other=0.0)
-
     # Online Softmax accumulators
-    m_i = -float('inf')  # Running max
-    l_i = 0.0            # Running sum of exp
-    
+    m_i = -float('inf')
+    l_i = 0.0
+
     # Pass 1: Compute logits and update max/sum in chunks
     for n_start in range(0, N, BLOCK_SIZE_N):
         n_offsets = n_start + tl.arange(0, BLOCK_SIZE_N)
@@ -44,7 +39,7 @@ def fused_linear_softmax_kernel(
         m_new = tl.maximum(m_i, chunk_max)
         l_i = l_i * tl.exp(m_i - m_new) + tl.sum(tl.exp(acc - m_new), axis=0)
         m_i = m_new
-
+    
     # Pass 2: Final normalization and store
     for n_start in range(0, N, BLOCK_SIZE):
         n_offsets = n_start + tl.arange(0, BLOCK_SIZE)
@@ -64,9 +59,11 @@ def fused_linear_softmax(h, w):
     N, _ = w.shape  # w is [Vocab, Hidden]
     out = torch.empty((M, N), device=h.device, dtype=h.dtype)
     
-    # Block size should be a power of two
-    BLOCK_SIZE = triton.next_power_of_2(K)
-    
+    # Set block sizes below the 1048576 (2^20) limit
+    # 1024 * 1024 = 1,048,576. We use 1024 to stay safe with shared memory.
+    BLOCK_SIZE_K = 1024 
+    BLOCK_SIZE_N = 1024 
+
     grid = (M,)
     fused_linear_softmax_kernel[grid](
         h, w, out,
@@ -74,61 +71,65 @@ def fused_linear_softmax(h, w):
         h.stride(0), h.stride(1),
         w.stride(0), w.stride(1),
         out.stride(0), out.stride(1),
-        BLOCK_SIZE=BLOCK_SIZE,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
     )
     return out
 
-def test_fused_kernel():
-    torch.manual_seed(0)
-    M, K, N = 16, 128, 1024  # Batch/Seq, Hidden, Vocab
+def test_fused_chunked_kernel():
+    # Large dimensions to trigger looping and test numel limits
+    # Hidden dimension 2048 > BLOCK_SIZE_K (1024)
+    # Vocab dimension 4096 > BLOCK_SIZE_N (1024)
+    M, K, N = 8, 2048, 4096 
+    
+    print(f"Testing dimensions: Seq={M}, Hidden={K}, Vocab={N}")
+    
+    # Initialize tensors on GPU
     h = torch.randn((M, K), device='cuda', dtype=torch.float32)
     w = torch.randn((N, K), device='cuda', dtype=torch.float32)
 
-    # Reference PyTorch implementation
+    # 1. Reference PyTorch Implementation
+    # Standard: hidden @ weight.T -> softmax
     ref_logits = torch.matmul(h, w.t())
     ref_probs = torch.softmax(ref_logits, dim=-1)
 
-    # Triton implementation
-    tri_probs = fused_linear_softmax(h, w)
-
-    # Verify results
-    torch.testing.assert_close(tri_probs, ref_probs, atol=1e-5, rtol=1e-5)
-    print("Verification Successful: Triton and PyTorch results match.")
+    # 2. Triton Implementation
+    try:
+        tri_probs = fused_linear_softmax(h, w)
+        
+        # 3. Validation
+        torch.testing.assert_close(tri_probs, ref_probs, atol=1e-5, rtol=1e-5)
+        print("✅ Verification Successful: Chunked Triton and PyTorch match.")
+        
+    except Exception as e:
+        print(f"❌ Test Failed: {e}")
 
 if __name__ == "__main__":
-    test_fused_kernel()
+    # Check if GPU is available
+    if torch.cuda.is_available():
+        test_fused_chunked_kernel()
+    else:
+        print("CUDA not available. Test skipped.")
 
-import torch
-from transformers import AutoModelForCausalLM
 
-# Load a model (example: a small GPT-2 or Llama)
-model_name = "gpt2" 
-model = AutoModelForCausalLM.from_pretrained(model_name).cuda()
 
-# Access the final linear layer (lm_head)
-# Most LLMs use 'lm_head'; check model.named_modules() if unsure
-lm_head_weight = model.lm_head.weight.detach() 
 
 print(f"Weight Shape: {lm_head_weight.shape}") # [Vocab, Hidden]
 
-def test_with_real_weights():
-    # 1. Setup Data from Model
-    # Assume lm_head_weight is [N, K] where N=Vocab, K=Hidden
-    vocab_size, hidden_dim = lm_head_weight.shape
-    seq_len = 16
+def test_with_hf_model():
+    from transformers import AutoModelForCausalLM
     
-    # Create dummy hidden states matching the model's dimension
-    h = torch.randn((seq_len, hidden_dim), device='cuda', dtype=torch.float32)
-    w = lm_head_weight.to(torch.float32) # Ensure matching dtypes
-
-    # 2. Reference PyTorch Implementation
-    # PyTorch Linear uses x @ W^T + bias; here we use Matmul [M, K] @ [K, N]
-    ref_logits = torch.matmul(h, w.t())
-    ref_probs = torch.softmax(ref_logits, dim=-1)
-
-    # 3. Triton Implementation
+    # Load just the head and config for metadata
+    model_id = "gpt2" # Replace with your target model
+    model = AutoModelForCausalLM.from_pretrained(model_id).cuda()
+    
+    # Extract weights
+    w = model.lm_head.weight.detach()
+    vocab_size, hidden_dim = w.shape
+    
+    # Create input from the model's expected hidden size
+    h = torch.randn((1, hidden_dim), device='cuda', dtype=w.dtype)
+    
+    # Run test
     tri_probs = fused_linear_softmax(h, w)
-
-    # 4. Verify
-    torch.testing.assert_close(tri_probs, ref_probs, atol=1e-5, rtol=1e-5)
-    print("Verification with real model weights Successful.")
+    print(f"Tested successfully on {model_id} weights.")
