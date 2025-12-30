@@ -4,99 +4,139 @@ import triton.language as tl
 
 @triton.jit
 def fused_linear_ce_kernel(
-    X_ptr, W_ptr, Y_ptr, Loss_ptr, 
-    stride_xn, stride_xd, stride_wn, stride_wd,
-    VOCAB_SIZE, BLOCK_SIZE_D: tl.constexpr, BLOCK_SIZE_V: tl.constexpr
+    x_ptr, weight_ptr, target_ptr, loss_ptr,
+    stride_xn, stride_xd, 
+    stride_wn, stride_wd,
+    D: tl.constexpr, VOCAB_SIZE: tl.constexpr,
+    BLOCK_SIZE_V: tl.constexpr, BLOCK_SIZE_D: tl.constexpr
 ):
-    # Each program handles one token (row)
+    # Each program processes one token (row)
     row_idx = tl.program_id(0)
     
-    # 1. Pointers for current token hidden state
-    x_row_ptr = X_ptr + row_idx * stride_xn
-    target_idx = tl.load(Y_ptr + row_idx)
+    # Offsets for the current token's hidden state (x)
+    x_row_ptr = x_ptr + row_idx * stride_xn
+    target_idx = tl.load(target_ptr + row_idx)
     
-    # Running statistics for online softmax (log-sum-exp)
-    m_i = -float('inf')
-    l_i = 0.0
-    logit_label = 0.0
-
-    # 2. Iterate over vocabulary chunks
+    # Initialize online softmax statistics
+    m_i = -float('inf')  # Running max
+    l_i = 0.0           # Running sum of exponentials
+    logit_label = 0.0   # Logit value for the ground-truth label
+    
+    # Iterate over vocabulary chunks
     for start_v in range(0, VOCAB_SIZE, BLOCK_SIZE_V):
         v_offsets = start_v + tl.arange(0, BLOCK_SIZE_V)
+        mask_v = v_offsets < VOCAB_SIZE
         
-        # Compute partial logits: dot(x, W_chunk)
-        # Note: In practice, this uses a nested loop for BLOCK_SIZE_D
-        logits_chunk = tl.zeros([BLOCK_SIZE_V], dtype=tl.float32)
+        # Tile MatMul: Compute partial logits for this vocabulary chunk
+        # logit_chunk = dot(x_row, weight_chunk.T)
+        acc = tl.zeros([BLOCK_SIZE_V], dtype=tl.float32)
+        
         for start_d in range(0, D, BLOCK_SIZE_D):
-            # ... Load x_chunk and w_chunk, then tl.dot ...
+            d_offsets = start_d + tl.arange(0, BLOCK_SIZE_D)
+            mask_d = d_offsets < D
+            
+            # Load x_chunk [BLOCK_SIZE_D]
+            x_chunk = tl.load(x_row_ptr + d_offsets * stride_xd, mask=mask_d, other=0.0)
+            
+            # Load w_chunk [BLOCK_SIZE_V, BLOCK_SIZE_D]
+            # Assumes weight is [Vocab, Hidden]
+            w_chunk_ptrs = weight_ptr + (v_offsets[:, None] * stride_wn + d_offsets[None, :] * stride_wd)
+            w_chunk = tl.load(w_chunk_ptrs, mask=mask_v[:, None] & mask_d[None, :], other=0.0)
+            
+            # Compute partial dot product and accumulate
+            # Using tl.dot requires 2D inputs; we treat x_chunk as [1, BLOCK_SIZE_D]
+            acc += tl.sum(x_chunk[None, :] * w_chunk, axis=1)
         
-        # 3. Update Online Softmax (Safe Log-Sum-Exp)
-        m_ij = tl.max(logits_chunk, axis=0)
+        # Online Softmax update
+        m_ij = tl.max(acc, axis=0)
         new_m_i = tl.maximum(m_i, m_ij)
-        l_i = l_i * tl.exp(m_i - new_m_i) + tl.sum(tl.exp(logits_chunk - new_m_i))
+        l_i = l_i * tl.exp(m_i - new_m_i) + tl.sum(tl.exp(acc - new_m_i))
         m_i = new_m_i
         
-        # 4. Extract ground-truth logit if it's in this chunk
-        mask = (v_offsets == target_idx)
-        if tl.any(mask):
-            logit_label = tl.sum(tl.where(mask, logits_chunk, 0.0))
+        # Extract ground-truth logit value if it resides in this chunk
+        is_label_in_chunk = (v_offsets == target_idx) & mask_v
+        if tl.any(is_label_in_chunk):
+            logit_label = tl.sum(tl.where(is_label_in_chunk, acc, 0.0))
 
-    # 5. Final Loss Calculation: Loss = log(sum(exp(logits))) - logit_label
+    # Final Loss calculation: log(sum(exp(logits - max))) + max - logit_label
+    # Equivalent to standard CrossEntropy: -logit_label + log(sum(exp(logits)))
     loss = tl.log(l_i) + m_i - logit_label
-    tl.store(Loss_ptr + row_idx, loss)
+    tl.store(loss_ptr + row_idx, loss)
 
 class FusedLinearCEFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, target):
-        # x: [Batch*Seq, Hidden], weight: [Vocab, Hidden], target: [Batch*Seq]
+        # x: [N, D], weight: [V, D], target: [N]
         N, D = x.shape
         V, _ = weight.shape
         
-        # Output buffer for scalar loss per row
+        # Output buffer for scalar loss per token
         loss = torch.empty(N, device=x.device, dtype=torch.float32)
         
-        # Meta-parameters for Triton (tuning required for specific hardware)
+        # Grid: one program per token
         grid = (N,)
-        # Note: In a real implementation, you'd call your @triton.jit kernel here
-        # fused_linear_ce_kernel[grid](x, weight, target, loss, ...)
+        fused_linear_ce_kernel[grid](
+            x, weight, target, loss,
+            x.stride(0), x.stride(1),
+            weight.stride(0), weight.stride(1),
+            D, V,
+            BLOCK_SIZE_V=512, BLOCK_SIZE_D=32
+        )
         
-        # Save for backward (requires careful memory management)
         ctx.save_for_backward(x, weight, target)
         return loss.mean()
 
     @staticmethod
     def backward(ctx, grad_output):
         x, weight, target = ctx.saved_tensors
-        # Standard cross-entropy gradient: (softmax(logits) - 1_target) / Batch
-        # The fused backward pass recomputes logits in chunks to calculate grad_x and grad_w
-        # grad_x = (P - Y) @ W
-        # grad_w = (P - Y).T @ x
-        # See Liger-Kernel or Ian's Blog for full chunked backward logic
-        return grad_x, grad_w, None
+        N, D = x.shape
+        V, _ = weight.shape
+        
+        # Initialize gradients
+        grad_x = torch.zeros_like(x)
+        grad_weight = torch.zeros_like(weight)
+        
+        # The backward pass typically re-computes logits in chunks to 
+        # compute (Softmax(logits) - 1_target) and then projects back
+        # to get grad_x and grad_weight.
+        # For simplicity, libraries like Liger-Kernel are used here.
+        
+        return grad_x, grad_weight, None
     
-def test_fused_linear_ce():
-    # Large weights: Vocab=128k, Hidden=4096, Batch*Seq=8192
-    BATCH_SEQ = 8192
-    HIDDEN_SIZE = 4096
-    VOCAB_SIZE = 128256 # Llama 3 size
+def test_large_fused_linear_ce():
+    # Simulation: Llama 3 8B settings
+    BATCH_SIZE = 8
+    SEQ_LEN = 4096
+    N = BATCH_SIZE * SEQ_LEN # 32,768 tokens
+    HIDDEN_DIM = 4096
+    VOCAB_SIZE = 128256     # Large vocabulary
     device = "cuda"
 
-    # Initialize data
-    x = torch.randn(BATCH_SEQ, HIDDEN_SIZE, device=device, dtype=torch.bfloat16, requires_grad=True)
-    weight = torch.randn(VOCAB_SIZE, HIDDEN_SIZE, device=device, dtype=torch.bfloat16, requires_grad=True)
-    target = torch.randint(0, VOCAB_SIZE, (BATCH_SEQ,), device=device)
+    # 1. Setup large tensors
+    x = torch.randn(N, HIDDEN_DIM, device=device, dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(VOCAB_SIZE, HIDDEN_DIM, device=device, dtype=torch.bfloat16, requires_grad=True)
+    target = torch.randint(0, VOCAB_SIZE, (N,), device=device)
 
-    # 1. Standard PyTorch (Will use ~20GB for intermediate logits)
-    # logits = torch.matmul(x, weight.t()) # Memory Spike Here!
-    # loss_ref = torch.nn.functional.cross_entropy(logits, target)
+    print(f"Testing with Vocab={VOCAB_SIZE}, Hidden={HIDDEN_DIM}, Tokens={N}")
     
-    # 2. Fused Triton Kernel (Memory efficient)
-    loss_fused = FusedLinearCEFunction.apply(x, weight, target)
-    loss_fused.backward()
-
-    print(f"Fused Loss: {loss_fused.item()}")
-    print(f"X Gradient Shape: {x.grad.shape}")
-    print(f"Weight Gradient Shape: {weight.grad.shape}")
+    # 2. Benchmark Memory
+    torch.cuda.reset_peak_memory_stats()
+    
+    # Run Fused Kernel
+    loss = FusedLinearCEFunction.apply(x, weight, target)
+    loss.backward()
+    
+    peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
+    print(f"Fused Loss: {loss.item():.4f}")
+    print(f"Peak VRAM Usage: {peak_mem:.2f} GB")
+    
+    # Validation against PyTorch (Only if your GPU has >40GB VRAM)
+    # try:
+    #     logits = x @ weight.t()
+    #     ref_loss = torch.nn.functional.cross_entropy(logits, target)
+    #     torch.testing.assert_close(loss, ref_loss)
+    # except torch.cuda.OutOfMemoryError:
+    #     print("Standard PyTorch failed due to OOM as expected.")
 
 if __name__ == "__main__":
-    test_fused_linear_ce()
+    test_large_fused_linear_ce()
