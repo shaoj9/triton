@@ -47,6 +47,38 @@ class EagleFlashInferSpeculator:
 #     draft_model_id="yuhuili/EAGLE-LLaMA3.1-Instruct-8B"
 # )
 
+@torch.inference_mode()
+def generate(self, input_ids, max_new_tokens=50, do_sample=False):
+    # 1. Warm up the context with the Target Model
+    # Target model verification uses FlashAttention
+    generated_ids = input_ids.clone()
+    
+    for _ in range(max_new_tokens // 4):  # EAGLE proposes ~4-5 tokens per step
+        # --- PHASE 1: DRAFT (FlashInfer Backend) ---
+        # Generate a tree of candidate tokens using FlashInfer's paged attention
+        # For simplicity, we'll demonstrate a single-chain proposal here
+        draft_tokens = self.speculate(generated_ids) 
+        
+        # --- PHASE 2: VERIFY (FlashAttention Backend) ---
+        # Verify all proposed tokens in one forward pass
+        # This is where FlashAttention's high throughput is used
+        # (Simplified logic: in a real EAGLE setup, you'd compare logits)
+        verified_tokens = self.target(torch.cat([generated_ids, draft_tokens], dim=-1))
+        
+        # Update your generated sequence
+        # Here we just take the next token for the test loop
+        next_token = verified_tokens.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        generated_ids = torch.cat([generated_ids, next_token], dim=-1)
+        
+        if next_token.item() == self.tokenizer.eos_token_id:
+            break
+            
+    return generated_ids
+
+# Inject the method into your existing class
+EagleFlashInferSpeculator.generate = generate
+
+
 
 def test_correctness(speculator, tokenizer, prompt="What are the laws of thermodynamics?"):
     inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
