@@ -247,15 +247,16 @@ class EAGLETreeGenerator:
         
         # THE KEY: Set forward context from target hidden states
         print(f"\nSetting forward context from target...")
-        if hasattr(self.draft_model, 'set_forward_context'):
-            self.draft_model.set_forward_context(target_hidden_states)
-            print(f"  ✓ Context set via draft_model.set_forward_context()")
-        elif hasattr(self.draft_model.model, 'set_forward_context'):
+        
+        # EAGLE architecture: set_forward_context is on the model (not the wrapper)
+        if hasattr(self.draft_model.model, 'set_forward_context'):
             self.draft_model.model.set_forward_context(target_hidden_states)
-            print(f"  ✓ Context set via draft_model.model.set_forward_context()")
+            print(f"  ✓ Context set: draft_model.model.set_forward_context()")
+            print(f"  ✓ EAGLE now conditioned on target's hidden states")
         else:
-            print(f"  ⚠ Warning: Model doesn't have set_forward_context")
-            print(f"  Falling back to standard approach")
+            print(f"  ⚠ Warning: draft_model.model doesn't have set_forward_context")
+            print(f"  This model may not be a proper EAGLE model")
+            print(f"  Continuing without context (results may be poor)")
         
         # Prepare embeddings for tree
         prefix_embeds = self.draft_embedding(input_ids)
@@ -276,6 +277,7 @@ class EAGLETreeGenerator:
         forward_start = time.time()
         
         with torch.no_grad():
+            # Forward through EAGLE's model (with set_forward_context already applied)
             outputs = self.draft_model.model(
                 inputs_embeds=full_embeds,
                 attention_mask=attention_mask,
@@ -283,6 +285,9 @@ class EAGLETreeGenerator:
                 use_cache=False,
                 return_dict=True
             )
+            
+            # Get logits from LM head
+            # Note: draft_model.lm_head is separate from draft_model.model
             logits = self.draft_model.lm_head(outputs.last_hidden_state)
         
         forward_time = time.time() - forward_start
