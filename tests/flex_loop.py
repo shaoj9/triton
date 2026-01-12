@@ -1,21 +1,15 @@
 """
-EAGLE Tree Generation in ONE Pass - Proper Implementation
-=========================================================
+EAGLE Tree Generation in ONE Pass - Using input_ids and positions
+=================================================================
 
-Combines:
-1. EAGLE's proper architecture (set_forward_context with target hidden states)
-2. Tree generation in ONE pass (using FlexAttention-style tree attention)
+Updated to use:
+- input_ids instead of inputs_embeds
+- positions instead of position_ids
 
-Architecture:
-1. Target generates hidden states for current sequence
-2. EAGLE.set_forward_context(hidden_states) - conditions EAGLE on target
-3. EAGLE generates ENTIRE tree in ONE pass (not sequential!)
-4. Target verifies all tree tokens
-5. Select best path through tree using speculative sampling
-6. Repeat
+This is cleaner and more standard for transformer models.
 
 Usage:
-    python eagle_tree_one_pass.py --prompt "The future of AI is"
+    python eagle_tree_input_ids.py --prompt "The future of AI is"
 """
 
 import torch
@@ -81,7 +75,7 @@ def create_tree_attention_mask(
     prefix_len: int,
     device: str = "cuda"
 ) -> torch.Tensor:
-    """Create tree attention mask - each node sees prefix + ancestors only"""
+    """Create tree attention mask"""
     num_nodes = len(parent_ids)
     total_len = prefix_len + num_nodes
     
@@ -94,7 +88,7 @@ def create_tree_attention_mask(
     # Tree sees prefix
     mask[prefix_len:, :prefix_len] = True
     
-    # Tree sees ancestors (not siblings!)
+    # Tree sees ancestors
     for node_idx in range(num_nodes):
         q_pos = prefix_len + node_idx
         mask[q_pos, q_pos] = True
@@ -104,7 +98,6 @@ def create_tree_attention_mask(
             mask[q_pos, prefix_len + parent_idx] = True
             parent_idx = parent_ids[parent_idx]
     
-    # Convert to additive mask
     attention_mask = torch.where(
         mask,
         torch.zeros(total_len, total_len, dtype=torch.float16, device=device),
@@ -114,25 +107,33 @@ def create_tree_attention_mask(
     return attention_mask.unsqueeze(0).unsqueeze(0)
 
 
-def create_position_ids(nodes: List[TreeNode], prefix_len: int, device: str = "cuda"):
-    """Create position IDs for tree"""
+def create_positions(nodes: List[TreeNode], prefix_len: int, device: str = "cuda"):
+    """
+    Create positions tensor (depth-based for tree)
+    
+    Returns:
+        positions: [1, total_len] position indices
+    """
     num_nodes = len(nodes)
-    position_ids = torch.zeros(1, prefix_len + num_nodes, dtype=torch.long, device=device)
-    position_ids[0, :prefix_len] = torch.arange(prefix_len)
+    positions = torch.zeros(1, prefix_len + num_nodes, dtype=torch.long, device=device)
     
+    # Prefix positions
+    positions[0, :prefix_len] = torch.arange(prefix_len)
+    
+    # Tree positions (depth-based)
     for node in nodes:
-        position_ids[0, prefix_len + node.node_id] = prefix_len + node.depth
+        positions[0, prefix_len + node.node_id] = prefix_len + node.depth
     
-    return position_ids
+    return positions
 
 
 # ============================================================================
-# EAGLE Tree Generator - ONE PASS
+# EAGLE Tree Generator - Using input_ids
 # ============================================================================
 
 class EAGLETreeGenerator:
     """
-    EAGLE with proper architecture that generates entire tree in ONE pass
+    EAGLE using input_ids and positions (not embeddings)
     """
     
     def __init__(
@@ -144,7 +145,7 @@ class EAGLETreeGenerator:
         tree_depth: int = 2
     ):
         print(f"\n{'='*70}")
-        print(f"INITIALIZING EAGLE TREE GENERATOR (ONE PASS)")
+        print(f"INITIALIZING EAGLE TREE GENERATOR (input_ids + positions)")
         print(f"{'='*70}")
         
         self.device = device
@@ -182,14 +183,14 @@ class EAGLETreeGenerator:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
-        self.draft_embedding = self.draft_model.model.embed_tokens
+        # Get a placeholder token for tree positions
+        # We'll use pad_token_id for unsampled tree positions
+        self.placeholder_token_id = self.tokenizer.pad_token_id
         
         print(f"{'='*70}\n")
     
     def get_target_hidden_states(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """
-        STEP 1: Get hidden states from target model
-        """
+        """Get hidden states from target model"""
         with torch.no_grad():
             outputs = self.target_model(
                 input_ids=input_ids,
@@ -209,12 +210,7 @@ class EAGLETreeGenerator:
         top_k: int = 20
     ) -> Tuple[List[TreeNode], torch.Tensor, torch.Tensor]:
         """
-        STEP 2: Generate ENTIRE tree in ONE pass using EAGLE
-        
-        Key differences from previous approach:
-        1. Uses target_hidden_states via set_forward_context
-        2. Generates ALL tree tokens in single forward pass
-        3. Much more efficient than sequential generation
+        Generate ENTIRE tree in ONE pass using input_ids and positions
         
         Args:
             input_ids: Current sequence [1, seq_len]
@@ -233,61 +229,58 @@ class EAGLETreeGenerator:
         nodes, parent_ids = build_tree_structure(self.tree_width, self.tree_depth)
         
         print(f"\n{'='*70}")
-        print(f"TREE GENERATION IN ONE PASS")
+        print(f"TREE GENERATION IN ONE PASS (input_ids + positions)")
         print(f"{'='*70}")
         print(f"Tree nodes: {len(nodes)}")
         print(f"Prefix length: {prefix_len}")
         
         # Create tree attention mask
         attention_mask = create_tree_attention_mask(parent_ids, prefix_len, self.device)
-        position_ids = create_position_ids(nodes, prefix_len, self.device)
+        positions = create_positions(nodes, prefix_len, self.device)
         
         print(f"Attention mask: {attention_mask.shape}")
-        print(f"Position IDs: {position_ids.shape}")
+        print(f"Positions: {positions.shape}")
         
-        # THE KEY: Set forward context from target hidden states
+        # Set forward context from target
         print(f"\nSetting forward context from target...")
-        
-        # EAGLE architecture: set_forward_context is on the model (not the wrapper)
         if hasattr(self.draft_model.model, 'set_forward_context'):
             self.draft_model.model.set_forward_context(target_hidden_states)
             print(f"  ✓ Context set: draft_model.model.set_forward_context()")
             print(f"  ✓ EAGLE now conditioned on target's hidden states")
         else:
             print(f"  ⚠ Warning: draft_model.model doesn't have set_forward_context")
-            print(f"  This model may not be a proper EAGLE model")
-            print(f"  Continuing without context (results may be poor)")
         
-        # Prepare embeddings for tree
-        prefix_embeds = self.draft_embedding(input_ids)
-        
-        # Initialize tree embeddings to zeros (will be filled by EAGLE)
-        tree_embeds = torch.zeros(
-            1, len(nodes), prefix_embeds.shape[-1],
-            dtype=self.dtype,
+        # Prepare input_ids for tree
+        # Tree positions filled with placeholder tokens initially
+        tree_token_ids = torch.full(
+            (1, len(nodes)),
+            self.placeholder_token_id,
+            dtype=torch.long,
             device=self.device
         )
         
-        full_embeds = torch.cat([prefix_embeds, tree_embeds], dim=1)
+        # Concatenate prefix + tree
+        full_input_ids = torch.cat([input_ids, tree_token_ids], dim=1)
         
-        print(f"Full embeddings: {full_embeds.shape}")
+        print(f"Full input_ids: {full_input_ids.shape}")
+        print(f"  Prefix: {input_ids[0].tolist()}")
+        print(f"  Tree placeholders: {tree_token_ids[0, :5].tolist()}...")
         
         # ONE FORWARD PASS - Generate all tree tokens!
         print(f"\nForward pass through EAGLE...")
         forward_start = time.time()
         
         with torch.no_grad():
-            # Forward through EAGLE's model (with set_forward_context already applied)
+            # Forward through EAGLE's model
             outputs = self.draft_model.model(
-                inputs_embeds=full_embeds,
+                input_ids=full_input_ids,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
+                positions=positions,  # Using positions instead of position_ids!
                 use_cache=False,
                 return_dict=True
             )
             
             # Get logits from LM head
-            # Note: draft_model.lm_head is separate from draft_model.model
             logits = self.draft_model.lm_head(outputs.last_hidden_state)
         
         forward_time = time.time() - forward_start
@@ -351,44 +344,33 @@ class EAGLETreeGenerator:
         draft_probs: torch.Tensor
     ) -> Tuple[torch.Tensor, List[int]]:
         """
-        STEP 3: Verify entire tree with target and select best path
-        
-        Args:
-            input_ids: Current sequence [1, seq_len]
-            draft_nodes: Tree nodes with draft tokens
-            draft_token_ids: [num_nodes] draft token IDs
-            draft_probs: [num_nodes, vocab_size] draft probabilities
-        
-        Returns:
-            accepted_tokens: Accepted token IDs from best path
-            accepted_path: Node IDs in accepted path
+        Verify entire tree with target using input_ids and positions
         """
         prefix_len = input_ids.shape[1]
         parent_ids = [node.parent_id for node in draft_nodes]
         
         print(f"\n{'='*70}")
-        print(f"VERIFICATION WITH TARGET")
+        print(f"VERIFICATION WITH TARGET (input_ids + positions)")
         print(f"{'='*70}")
         
-        # Create same tree attention mask for verification
+        # Create same tree attention mask
         attention_mask = create_tree_attention_mask(parent_ids, prefix_len, self.device)
-        position_ids = create_position_ids(draft_nodes, prefix_len, self.device)
+        positions = create_positions(draft_nodes, prefix_len, self.device)
         
-        # Prepare embeddings with draft tokens
-        prefix_embeds = self.target_model.model.embed_tokens(input_ids)
-        draft_embeds = self.target_model.model.embed_tokens(draft_token_ids.unsqueeze(0))
-        full_embeds = torch.cat([prefix_embeds, draft_embeds], dim=1)
+        # Concatenate prefix + draft tokens
+        full_input_ids = torch.cat([input_ids, draft_token_ids.unsqueeze(0)], dim=1)
         
         print(f"Verifying {len(draft_token_ids)} draft tokens...")
+        print(f"Full input_ids: {full_input_ids.shape}")
         
         # Forward through target
         verify_start = time.time()
         
         with torch.no_grad():
             outputs = self.target_model.model(
-                inputs_embeds=full_embeds,
+                input_ids=full_input_ids,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
+                positions=positions,  # Using positions!
                 use_cache=False,
                 return_dict=True
             )
@@ -401,11 +383,11 @@ class EAGLETreeGenerator:
         
         print(f"  ✓ Verification complete in {verify_time:.3f}s")
         
-        # Store target probabilities in nodes
+        # Store target probabilities
         for node_idx, node in enumerate(draft_nodes):
             node.target_prob = target_probs[node_idx, node.token_id].item()
         
-        # Find best path through tree using speculative sampling
+        # Find best path
         print(f"\nFinding best path through tree...")
         accepted_path = self._find_best_path_speculative(
             draft_nodes, target_probs, draft_probs
@@ -416,7 +398,7 @@ class EAGLETreeGenerator:
         print(f"{'='*70}\n")
         
         if len(accepted_path) == 0:
-            # Fallback: sample from target at root
+            # Fallback
             new_token = torch.multinomial(target_probs[0], 1).item()
             return torch.tensor([new_token], device=self.device), []
         
@@ -434,9 +416,7 @@ class EAGLETreeGenerator:
         target_probs: torch.Tensor,
         draft_probs: torch.Tensor
     ) -> List[int]:
-        """
-        Find best path through tree using speculative sampling
-        """
+        """Find best path using speculative sampling"""
         accepted_path = []
         current_node_id = 0
         
@@ -452,11 +432,10 @@ class EAGLETreeGenerator:
             if torch.rand(1).item() < accept_prob:
                 accepted_path.append(node.node_id)
                 
-                # If leaf, done
                 if len(node.children) == 0:
                     break
                 
-                # Select best child based on target probability
+                # Select best child
                 best_child_id = None
                 best_prob = -1.0
                 
@@ -473,7 +452,6 @@ class EAGLETreeGenerator:
                 
                 current_node_id = best_child_id
             else:
-                # Rejected
                 break
         
         return accepted_path
@@ -486,11 +464,9 @@ class EAGLETreeGenerator:
         top_k: int = 20,
         verbose: bool = True
     ) -> Tuple[str, Dict]:
-        """
-        Generate text using EAGLE with tree generation in one pass
-        """
+        """Generate text using EAGLE with input_ids and positions"""
         print(f"\n{'='*70}")
-        print(f"EAGLE TREE GENERATION - ONE PASS")
+        print(f"EAGLE TREE GENERATION - input_ids + positions")
         print(f"{'='*70}")
         print(f"Prompt: '{prompt}'")
         print(f"Max new tokens: {max_new_tokens}")
@@ -507,9 +483,7 @@ class EAGLETreeGenerator:
             'iterations': 0,
             'total_draft': 0,
             'total_accepted': 0,
-            'acceptance_rates': [],
-            'forward_times': [],
-            'verify_times': []
+            'acceptance_rates': []
         }
         
         start_time = time.time()
@@ -525,7 +499,7 @@ class EAGLETreeGenerator:
                 print(f"{'='*70}")
                 print(f"Generated: {current_generated}/{max_new_tokens} tokens")
             
-            # STEP 1: Get target hidden states
+            # Get target hidden states
             if verbose:
                 print(f"\nStep 1: Getting target hidden states...")
             
@@ -537,7 +511,7 @@ class EAGLETreeGenerator:
                 print(f"  ✓ Hidden states: {target_hidden_states.shape}")
                 print(f"  Time: {hidden_time:.3f}s")
             
-            # STEP 2: Generate tree in ONE pass
+            # Generate tree
             if verbose:
                 print(f"\nStep 2: Generating tree ({self.num_tree_nodes} tokens) in ONE pass...")
             
@@ -550,7 +524,7 @@ class EAGLETreeGenerator:
             
             stats['total_draft'] += len(draft_ids)
             
-            # STEP 3: Verify and select path
+            # Verify and select path
             if verbose:
                 print(f"\nStep 3: Verifying tree and selecting best path...")
             
@@ -638,30 +612,24 @@ class EAGLETreeGenerator:
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="EAGLE Tree Generation - One Pass")
-    parser.add_argument("--prompt", type=str, default="The future of artificial intelligence is",
-                       help="Input prompt")
-    parser.add_argument("--max-new-tokens", type=int, default=50,
-                       help="Maximum new tokens")
-    parser.add_argument("--tree-width", type=int, default=3,
-                       help="Tree width")
-    parser.add_argument("--tree-depth", type=int, default=2,
-                       help="Tree depth")
-    parser.add_argument("--temperature", type=float, default=1.0,
-                       help="Temperature")
-    parser.add_argument("--top-k", type=int, default=20,
-                       help="Top-k")
+    parser = argparse.ArgumentParser(description="EAGLE Tree Generation - input_ids + positions")
+    parser.add_argument("--prompt", type=str, default="The future of artificial intelligence is")
+    parser.add_argument("--max-new-tokens", type=int, default=50)
+    parser.add_argument("--tree-width", type=int, default=3)
+    parser.add_argument("--tree-depth", type=int, default=2)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-k", type=int, default=20)
     
     args = parser.parse_args()
     
     print("\n" + "="*70)
-    print("EAGLE TREE GENERATION IN ONE PASS")
+    print("EAGLE TREE GENERATION - input_ids + positions")
     print("="*70)
     print("Features:")
+    print("  ✓ Uses input_ids (not inputs_embeds)")
+    print("  ✓ Uses positions (not position_ids)")
     print("  ✓ Proper EAGLE architecture (set_forward_context)")
-    print("  ✓ Tree generation in ONE pass (not sequential)")
-    print("  ✓ FlexAttention-style tree masks")
-    print("  ✓ Speculative sampling for path selection")
+    print("  ✓ Tree generation in ONE pass")
     print("="*70)
     
     # Initialize
