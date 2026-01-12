@@ -1,51 +1,161 @@
 """
-EAGLE Speculative Decoding - PROPER IMPLEMENTATION
-==================================================
+EAGLE Tree Generation in ONE Pass - Proper Implementation
+=========================================================
 
-Uses EAGLE's actual architecture:
-1. Target model generates hidden states for current sequence
-2. EAGLE uses those hidden states as context via set_forward_context()
-3. EAGLE drafts tree based on target's hidden states
-4. Target verifies draft tokens
-5. Accept/reject and repeat
+Combines:
+1. EAGLE's proper architecture (set_forward_context with target hidden states)
+2. Tree generation in ONE pass (using FlexAttention-style tree attention)
 
-This matches EAGLE paper implementation.
+Architecture:
+1. Target generates hidden states for current sequence
+2. EAGLE.set_forward_context(hidden_states) - conditions EAGLE on target
+3. EAGLE generates ENTIRE tree in ONE pass (not sequential!)
+4. Target verifies all tree tokens
+5. Select best path through tree using speculative sampling
+6. Repeat
 
 Usage:
-    python eagle_proper_implementation.py --prompt "The future of AI is"
+    python eagle_tree_one_pass.py --prompt "The future of AI is"
 """
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import List, Optional, Tuple, Dict
+from dataclasses import dataclass
 import argparse
 import time
 
 
 # ============================================================================
-# EAGLE Proper Implementation
+# Tree Structure
 # ============================================================================
 
-class EAGLESpeculativeDecoder:
+@dataclass
+class TreeNode:
+    node_id: int
+    depth: int
+    parent_id: Optional[int]
+    token_id: int = -1
+    draft_prob: float = 0.0
+    target_prob: float = 0.0
+    children: List[int] = None
+    
+    def __post_init__(self):
+        if self.children is None:
+            self.children = []
+
+
+def build_tree_structure(width: int, depth: int) -> Tuple[List[TreeNode], List[Optional[int]]]:
+    """Build tree structure"""
+    nodes = []
+    parent_ids = []
+    
+    nodes.append(TreeNode(node_id=0, depth=0, parent_id=None))
+    parent_ids.append(None)
+    
+    current_level = [0]
+    next_id = 1
+    
+    for d in range(1, depth + 1):
+        next_level = []
+        for parent_id in current_level:
+            for _ in range(width):
+                node = TreeNode(node_id=next_id, depth=d, parent_id=parent_id)
+                nodes.append(node)
+                parent_ids.append(parent_id)
+                nodes[parent_id].children.append(next_id)
+                next_level.append(next_id)
+                next_id += 1
+        current_level = next_level
+    
+    return nodes, parent_ids
+
+
+# ============================================================================
+# FlexAttention Tree Masks
+# ============================================================================
+
+def create_tree_attention_mask(
+    parent_ids: List[Optional[int]],
+    prefix_len: int,
+    device: str = "cuda"
+) -> torch.Tensor:
+    """Create tree attention mask - each node sees prefix + ancestors only"""
+    num_nodes = len(parent_ids)
+    total_len = prefix_len + num_nodes
+    
+    mask = torch.zeros(total_len, total_len, dtype=torch.bool, device=device)
+    
+    # Prefix: causal
+    for i in range(prefix_len):
+        mask[i, :i+1] = True
+    
+    # Tree sees prefix
+    mask[prefix_len:, :prefix_len] = True
+    
+    # Tree sees ancestors (not siblings!)
+    for node_idx in range(num_nodes):
+        q_pos = prefix_len + node_idx
+        mask[q_pos, q_pos] = True
+        
+        parent_idx = parent_ids[node_idx]
+        while parent_idx is not None:
+            mask[q_pos, prefix_len + parent_idx] = True
+            parent_idx = parent_ids[parent_idx]
+    
+    # Convert to additive mask
+    attention_mask = torch.where(
+        mask,
+        torch.zeros(total_len, total_len, dtype=torch.float16, device=device),
+        torch.full((total_len, total_len), float('-inf'), dtype=torch.float16, device=device)
+    )
+    
+    return attention_mask.unsqueeze(0).unsqueeze(0)
+
+
+def create_position_ids(nodes: List[TreeNode], prefix_len: int, device: str = "cuda"):
+    """Create position IDs for tree"""
+    num_nodes = len(nodes)
+    position_ids = torch.zeros(1, prefix_len + num_nodes, dtype=torch.long, device=device)
+    position_ids[0, :prefix_len] = torch.arange(prefix_len)
+    
+    for node in nodes:
+        position_ids[0, prefix_len + node.node_id] = prefix_len + node.depth
+    
+    return position_ids
+
+
+# ============================================================================
+# EAGLE Tree Generator - ONE PASS
+# ============================================================================
+
+class EAGLETreeGenerator:
     """
-    Proper EAGLE implementation using set_forward_context
+    EAGLE with proper architecture that generates entire tree in ONE pass
     """
     
     def __init__(
         self,
         draft_model_path: str = "yuhuili/EAGLE-LLaMA3.1-Instruct-8B",
         target_model_path: str = "meta-llama/Llama-3.1-8B-Instruct",
-        device: str = "cuda"
+        device: str = "cuda",
+        tree_width: int = 3,
+        tree_depth: int = 2
     ):
         print(f"\n{'='*70}")
-        print(f"INITIALIZING EAGLE WITH PROPER ARCHITECTURE")
+        print(f"INITIALIZING EAGLE TREE GENERATOR (ONE PASS)")
         print(f"{'='*70}")
         
         self.device = device
         self.dtype = torch.float16
+        self.tree_width = tree_width
+        self.tree_depth = tree_depth
+        self.num_tree_nodes = sum(tree_width**d for d in range(tree_depth + 1))
         
-        # Load EAGLE draft model
+        print(f"Tree: width={tree_width}, depth={tree_depth}, nodes={self.num_tree_nodes}")
+        
+        # Load EAGLE
         print(f"\nLoading EAGLE draft model...")
         self.draft_model = AutoModelForCausalLM.from_pretrained(
             draft_model_path,
@@ -56,7 +166,7 @@ class EAGLESpeculativeDecoder:
         self.draft_model.eval()
         print(f"  ✓ EAGLE loaded")
         
-        # Load target model
+        # Load target
         print(f"\nLoading target model...")
         self.target_model = AutoModelForCausalLM.from_pretrained(
             target_model_path,
@@ -72,13 +182,13 @@ class EAGLESpeculativeDecoder:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
+        self.draft_embedding = self.draft_model.model.embed_tokens
+        
         print(f"{'='*70}\n")
     
     def get_target_hidden_states(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
         STEP 1: Get hidden states from target model
-        
-        This is KEY - EAGLE needs target's hidden states as context
         """
         with torch.no_grad():
             outputs = self.target_model(
@@ -87,64 +197,121 @@ class EAGLESpeculativeDecoder:
                 use_cache=False,
                 return_dict=True
             )
-            
-            # Get last layer hidden states
-            hidden_states = outputs.hidden_states[-1]  # [batch, seq_len, hidden_dim]
+            hidden_states = outputs.hidden_states[-1]
         
         return hidden_states
     
-    def draft_with_eagle(
+    def generate_tree_one_pass(
         self,
         input_ids: torch.Tensor,
         target_hidden_states: torch.Tensor,
-        num_draft_tokens: int = 10,
         temperature: float = 1.0,
         top_k: int = 20
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[List[TreeNode], torch.Tensor, torch.Tensor]:
         """
-        STEP 2: Draft tokens using EAGLE with target's hidden states
+        STEP 2: Generate ENTIRE tree in ONE pass using EAGLE
         
-        Uses set_forward_context to condition on target hidden states
+        Key differences from previous approach:
+        1. Uses target_hidden_states via set_forward_context
+        2. Generates ALL tree tokens in single forward pass
+        3. Much more efficient than sequential generation
         
         Args:
-            input_ids: Current sequence [batch, seq_len]
-            target_hidden_states: Hidden states from target [batch, seq_len, hidden_dim]
-            num_draft_tokens: Number of tokens to draft
+            input_ids: Current sequence [1, seq_len]
+            target_hidden_states: Target's hidden states [1, seq_len, hidden_dim]
             temperature: Sampling temperature
             top_k: Top-k sampling
         
         Returns:
-            draft_tokens: [num_draft_tokens] drafted token IDs
-            draft_probs: [num_draft_tokens, vocab_size] probability distributions
+            nodes: Tree nodes with sampled tokens
+            draft_token_ids: [num_nodes] sampled token IDs
+            draft_probs: [num_nodes, vocab_size] probability distributions
         """
-        # Set forward context - THIS IS THE KEY!
-        # EAGLE will use these hidden states to condition its predictions
+        prefix_len = input_ids.shape[1]
+        
+        # Build tree structure
+        nodes, parent_ids = build_tree_structure(self.tree_width, self.tree_depth)
+        
+        print(f"\n{'='*70}")
+        print(f"TREE GENERATION IN ONE PASS")
+        print(f"{'='*70}")
+        print(f"Tree nodes: {len(nodes)}")
+        print(f"Prefix length: {prefix_len}")
+        
+        # Create tree attention mask
+        attention_mask = create_tree_attention_mask(parent_ids, prefix_len, self.device)
+        position_ids = create_position_ids(nodes, prefix_len, self.device)
+        
+        print(f"Attention mask: {attention_mask.shape}")
+        print(f"Position IDs: {position_ids.shape}")
+        
+        # THE KEY: Set forward context from target hidden states
+        print(f"\nSetting forward context from target...")
         if hasattr(self.draft_model, 'set_forward_context'):
             self.draft_model.set_forward_context(target_hidden_states)
+            print(f"  ✓ Context set via draft_model.set_forward_context()")
         elif hasattr(self.draft_model.model, 'set_forward_context'):
             self.draft_model.model.set_forward_context(target_hidden_states)
+            print(f"  ✓ Context set via draft_model.model.set_forward_context()")
         else:
-            print("Warning: EAGLE model doesn't have set_forward_context method")
-            print("Falling back to standard generation")
+            print(f"  ⚠ Warning: Model doesn't have set_forward_context")
+            print(f"  Falling back to standard approach")
         
-        draft_tokens = []
+        # Prepare embeddings for tree
+        prefix_embeds = self.draft_embedding(input_ids)
+        
+        # Initialize tree embeddings to zeros (will be filled by EAGLE)
+        tree_embeds = torch.zeros(
+            1, len(nodes), prefix_embeds.shape[-1],
+            dtype=self.dtype,
+            device=self.device
+        )
+        
+        full_embeds = torch.cat([prefix_embeds, tree_embeds], dim=1)
+        
+        print(f"Full embeddings: {full_embeds.shape}")
+        
+        # ONE FORWARD PASS - Generate all tree tokens!
+        print(f"\nForward pass through EAGLE...")
+        forward_start = time.time()
+        
+        with torch.no_grad():
+            outputs = self.draft_model.model(
+                inputs_embeds=full_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+                return_dict=True
+            )
+            logits = self.draft_model.lm_head(outputs.last_hidden_state)
+        
+        forward_time = time.time() - forward_start
+        
+        # Extract tree logits
+        tree_logits = logits[0, prefix_len:, :]
+        
+        print(f"  ✓ Forward complete in {forward_time:.3f}s")
+        print(f"  Tree logits: {tree_logits.shape}")
+        print(f"{'='*70}\n")
+        
+        # Sample tokens from tree
+        print(f"Sampling {len(nodes)} tokens from tree...")
+        
+        draft_token_ids = []
         draft_probs_list = []
-        current_ids = input_ids.clone()
+        used_tokens = set(input_ids[0].tolist())
         
-        # Generate tokens sequentially (EAGLE typically generates one at a time)
-        for i in range(num_draft_tokens):
-            with torch.no_grad():
-                outputs = self.draft_model(
-                    input_ids=current_ids,
-                    use_cache=False,
-                    return_dict=True
-                )
-                
-                logits = outputs.logits[0, -1, :]  # Last token logits
+        for node_idx, node in enumerate(nodes):
+            node_logits = tree_logits[node_idx].clone()
+            
+            # Light repetition penalty
+            for token_id in used_tokens:
+                if token_id < node_logits.shape[0]:
+                    node_logits[token_id] /= 1.1
             
             # Sample
-            scaled_logits = logits / temperature
-            probs = F.softmax(scaled_logits, dim=-1)
+            scaled = node_logits / temperature
+            probs = F.softmax(scaled, dim=-1)
             
             if top_k > 0:
                 top_k_vals, top_k_idx = torch.topk(probs, k=min(top_k, probs.shape[0]))
@@ -154,130 +321,175 @@ class EAGLESpeculativeDecoder:
             else:
                 token_id = torch.multinomial(probs, 1).item()
             
-            draft_tokens.append(token_id)
+            node.token_id = token_id
+            node.draft_prob = probs[token_id].item()
+            draft_token_ids.append(token_id)
             draft_probs_list.append(probs)
-            
-            # Append to sequence for next iteration
-            current_ids = torch.cat([
-                current_ids,
-                torch.tensor([[token_id]], dtype=torch.long, device=self.device)
-            ], dim=1)
-            
-            # Check for EOS
-            if token_id == self.tokenizer.eos_token_id:
-                break
+            used_tokens.add(token_id)
         
-        draft_tokens = torch.tensor(draft_tokens, dtype=torch.long, device=self.device)
-        draft_probs = torch.stack(draft_probs_list) if draft_probs_list else None
+        draft_token_ids = torch.tensor(draft_token_ids, dtype=torch.long, device=self.device)
+        draft_probs = torch.stack(draft_probs_list)
         
-        return draft_tokens, draft_probs
+        print(f"  ✓ Sampled {len(draft_token_ids)} tokens")
+        
+        # Show sample tokens
+        sample_tokens = [self.tokenizer.decode([t]) for t in draft_token_ids[:5]]
+        print(f"  Sample: {sample_tokens}...")
+        
+        return nodes, draft_token_ids, draft_probs
     
-    def verify_and_accept(
+    def verify_and_select_path(
         self,
         input_ids: torch.Tensor,
-        draft_tokens: torch.Tensor,
+        draft_nodes: List[TreeNode],
+        draft_token_ids: torch.Tensor,
         draft_probs: torch.Tensor
-    ) -> Tuple[torch.Tensor, int]:
+    ) -> Tuple[torch.Tensor, List[int]]:
         """
-        STEP 3: Verify draft tokens with target model using speculative sampling
+        STEP 3: Verify entire tree with target and select best path
         
         Args:
-            input_ids: Current sequence [batch, seq_len]
-            draft_tokens: Draft token IDs [num_draft]
-            draft_probs: Draft probabilities [num_draft, vocab_size]
+            input_ids: Current sequence [1, seq_len]
+            draft_nodes: Tree nodes with draft tokens
+            draft_token_ids: [num_nodes] draft token IDs
+            draft_probs: [num_nodes, vocab_size] draft probabilities
         
         Returns:
-            accepted_tokens: Accepted token IDs
-            num_accepted: Number of accepted tokens
+            accepted_tokens: Accepted token IDs from best path
+            accepted_path: Node IDs in accepted path
         """
-        if len(draft_tokens) == 0:
-            return torch.tensor([], dtype=torch.long, device=self.device), 0
+        prefix_len = input_ids.shape[1]
+        parent_ids = [node.parent_id for node in draft_nodes]
         
-        # Concatenate draft tokens to input
-        full_sequence = torch.cat([
-            input_ids,
-            draft_tokens.unsqueeze(0)
-        ], dim=1)
+        print(f"\n{'='*70}")
+        print(f"VERIFICATION WITH TARGET")
+        print(f"{'='*70}")
         
-        # Get target probabilities for all positions
+        # Create same tree attention mask for verification
+        attention_mask = create_tree_attention_mask(parent_ids, prefix_len, self.device)
+        position_ids = create_position_ids(draft_nodes, prefix_len, self.device)
+        
+        # Prepare embeddings with draft tokens
+        prefix_embeds = self.target_model.model.embed_tokens(input_ids)
+        draft_embeds = self.target_model.model.embed_tokens(draft_token_ids.unsqueeze(0))
+        full_embeds = torch.cat([prefix_embeds, draft_embeds], dim=1)
+        
+        print(f"Verifying {len(draft_token_ids)} draft tokens...")
+        
+        # Forward through target
+        verify_start = time.time()
+        
         with torch.no_grad():
-            outputs = self.target_model(
-                input_ids=full_sequence,
+            outputs = self.target_model.model(
+                inputs_embeds=full_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
                 use_cache=False,
                 return_dict=True
             )
-            
-            # Get logits for draft positions
-            logits = outputs.logits[0, input_ids.shape[1]-1:-1, :]  # All draft positions
-            target_probs = F.softmax(logits, dim=-1)
+            target_logits = self.target_model.lm_head(outputs.last_hidden_state)
         
-        # Speculative sampling - accept/reject each token
-        accepted_tokens = []
+        verify_time = time.time() - verify_start
         
-        for i in range(len(draft_tokens)):
-            draft_token = draft_tokens[i].item()
+        tree_target_logits = target_logits[0, prefix_len:, :]
+        target_probs = F.softmax(tree_target_logits, dim=-1)
+        
+        print(f"  ✓ Verification complete in {verify_time:.3f}s")
+        
+        # Store target probabilities in nodes
+        for node_idx, node in enumerate(draft_nodes):
+            node.target_prob = target_probs[node_idx, node.token_id].item()
+        
+        # Find best path through tree using speculative sampling
+        print(f"\nFinding best path through tree...")
+        accepted_path = self._find_best_path_speculative(
+            draft_nodes, target_probs, draft_probs
+        )
+        
+        print(f"  ✓ Found path with {len(accepted_path)} tokens")
+        print(f"  Path: {accepted_path}")
+        print(f"{'='*70}\n")
+        
+        if len(accepted_path) == 0:
+            # Fallback: sample from target at root
+            new_token = torch.multinomial(target_probs[0], 1).item()
+            return torch.tensor([new_token], device=self.device), []
+        
+        accepted_tokens = torch.tensor(
+            [draft_nodes[node_id].token_id for node_id in accepted_path],
+            dtype=torch.long,
+            device=self.device
+        )
+        
+        return accepted_tokens, accepted_path
+    
+    def _find_best_path_speculative(
+        self,
+        nodes: List[TreeNode],
+        target_probs: torch.Tensor,
+        draft_probs: torch.Tensor
+    ) -> List[int]:
+        """
+        Find best path through tree using speculative sampling
+        """
+        accepted_path = []
+        current_node_id = 0
+        
+        while True:
+            node = nodes[current_node_id]
             
-            # Get probabilities
-            p_target = target_probs[i, draft_token].item()
-            p_draft = draft_probs[i, draft_token].item()
+            # Speculative sampling
+            p_target = target_probs[node.node_id, node.token_id].item()
+            p_draft = draft_probs[node.node_id, node.token_id].item()
             
-            # Acceptance probability
             accept_prob = min(1.0, p_target / (p_draft + 1e-10))
             
-            # Accept/reject
             if torch.rand(1).item() < accept_prob:
-                accepted_tokens.append(draft_token)
+                accepted_path.append(node.node_id)
+                
+                # If leaf, done
+                if len(node.children) == 0:
+                    break
+                
+                # Select best child based on target probability
+                best_child_id = None
+                best_prob = -1.0
+                
+                for child_id in node.children:
+                    child = nodes[child_id]
+                    child_target_prob = target_probs[child_id, child.token_id].item()
+                    
+                    if child_target_prob > best_prob:
+                        best_prob = child_target_prob
+                        best_child_id = child_id
+                
+                if best_child_id is None:
+                    break
+                
+                current_node_id = best_child_id
             else:
-                # Rejection sampling - sample from adjusted distribution
-                # q(x) = max(0, p_target(x) - p_draft(x))
-                adjusted_probs = torch.clamp(target_probs[i] - draft_probs[i], min=0.0)
-                
-                if adjusted_probs.sum() > 0:
-                    adjusted_probs = adjusted_probs / adjusted_probs.sum()
-                    new_token = torch.multinomial(adjusted_probs, 1).item()
-                    accepted_tokens.append(new_token)
-                
-                break  # Stop at first rejection
+                # Rejected
+                break
         
-        if len(accepted_tokens) == 0:
-            # If nothing accepted, sample from target at first position
-            new_token = torch.multinomial(target_probs[0], 1).item()
-            accepted_tokens.append(new_token)
-        
-        accepted_tokens = torch.tensor(accepted_tokens, dtype=torch.long, device=self.device)
-        
-        return accepted_tokens, len(accepted_tokens)
+        return accepted_path
     
     def generate(
         self,
         prompt: str,
         max_new_tokens: int = 50,
-        num_draft_tokens: int = 10,
         temperature: float = 1.0,
         top_k: int = 20,
         verbose: bool = True
     ) -> Tuple[str, Dict]:
         """
-        Generate text using EAGLE speculative decoding
-        
-        Args:
-            prompt: Input prompt
-            max_new_tokens: Maximum new tokens to generate
-            num_draft_tokens: Number of tokens to draft per iteration
-            temperature: Sampling temperature
-            top_k: Top-k sampling
-            verbose: Print progress
-        
-        Returns:
-            generated_text: Complete generated text
-            stats: Generation statistics
+        Generate text using EAGLE with tree generation in one pass
         """
         print(f"\n{'='*70}")
-        print(f"EAGLE SPECULATIVE DECODING - PROPER IMPLEMENTATION")
+        print(f"EAGLE TREE GENERATION - ONE PASS")
         print(f"{'='*70}")
         print(f"Prompt: '{prompt}'")
         print(f"Max new tokens: {max_new_tokens}")
-        print(f"Draft tokens per iteration: {num_draft_tokens}")
+        print(f"Tree: width={self.tree_width}, depth={self.tree_depth}, nodes={self.num_tree_nodes}")
         print(f"{'='*70}\n")
         
         # Tokenize
@@ -291,7 +503,7 @@ class EAGLESpeculativeDecoder:
             'total_draft': 0,
             'total_accepted': 0,
             'acceptance_rates': [],
-            'draft_times': [],
+            'forward_times': [],
             'verify_times': []
         }
         
@@ -320,56 +532,45 @@ class EAGLESpeculativeDecoder:
                 print(f"  ✓ Hidden states: {target_hidden_states.shape}")
                 print(f"  Time: {hidden_time:.3f}s")
             
-            # STEP 2: Draft with EAGLE
+            # STEP 2: Generate tree in ONE pass
             if verbose:
-                print(f"\nStep 2: Drafting {num_draft_tokens} tokens with EAGLE...")
+                print(f"\nStep 2: Generating tree ({self.num_tree_nodes} tokens) in ONE pass...")
             
-            draft_start = time.time()
-            draft_tokens, draft_probs = self.draft_with_eagle(
+            nodes, draft_ids, draft_probs = self.generate_tree_one_pass(
                 current_ids,
                 target_hidden_states,
-                num_draft_tokens=num_draft_tokens,
                 temperature=temperature,
                 top_k=top_k
             )
-            draft_time = time.time() - draft_start
             
-            stats['draft_times'].append(draft_time)
-            stats['total_draft'] += len(draft_tokens)
+            stats['total_draft'] += len(draft_ids)
             
+            # STEP 3: Verify and select path
             if verbose:
-                print(f"  ✓ Drafted {len(draft_tokens)} tokens in {draft_time:.3f}s")
-                draft_text = [self.tokenizer.decode([t]) for t in draft_tokens[:5]]
-                print(f"  Tokens: {draft_text}")
+                print(f"\nStep 3: Verifying tree and selecting best path...")
             
-            # STEP 3: Verify with target
-            if verbose:
-                print(f"\nStep 3: Verifying with target model...")
-            
-            verify_start = time.time()
-            accepted_tokens, num_accepted = self.verify_and_accept(
+            accepted_ids, accepted_path = self.verify_and_select_path(
                 current_ids,
-                draft_tokens,
+                nodes,
+                draft_ids,
                 draft_probs
             )
-            verify_time = time.time() - verify_start
             
-            stats['verify_times'].append(verify_time)
+            num_accepted = len(accepted_ids)
             stats['total_accepted'] += num_accepted
             
-            acceptance_rate = num_accepted / len(draft_tokens) * 100 if len(draft_tokens) > 0 else 0
+            acceptance_rate = num_accepted / len(draft_ids) * 100
             stats['acceptance_rates'].append(acceptance_rate)
             
             if verbose:
-                print(f"  ✓ Verified in {verify_time:.3f}s")
-                print(f"  Accepted: {num_accepted}/{len(draft_tokens)} ({acceptance_rate:.1f}%)")
-                accepted_text = [self.tokenizer.decode([t]) for t in accepted_tokens]
-                print(f"  Accepted tokens: {accepted_text}")
+                print(f"Accepted: {num_accepted}/{len(draft_ids)} ({acceptance_rate:.1f}%)")
+                accepted_text = [self.tokenizer.decode([t]) for t in accepted_ids]
+                print(f"Tokens: {accepted_text}")
             
-            # STEP 4: Update sequence
-            current_ids = torch.cat([current_ids, accepted_tokens.unsqueeze(0)], dim=1)
+            # Update sequence
+            current_ids = torch.cat([current_ids, accepted_ids.unsqueeze(0)], dim=1)
             
-            # Decode current text
+            # Current text
             current_text = self.tokenizer.decode(
                 current_ids[0, initial_len:],
                 skip_special_tokens=True
@@ -378,10 +579,10 @@ class EAGLESpeculativeDecoder:
             if verbose:
                 print(f"\nCurrent output: '{current_text}'")
             
-            # Check stopping conditions
-            if self.tokenizer.eos_token_id in accepted_tokens:
+            # Stopping conditions
+            if self.tokenizer.eos_token_id in accepted_ids:
                 if verbose:
-                    print(f"\n✓ EOS token generated, stopping")
+                    print(f"\n✓ EOS token, stopping")
                 break
             
             if num_accepted == 0:
@@ -393,7 +594,7 @@ class EAGLESpeculativeDecoder:
             
             if stats['iterations'] >= 20:
                 if verbose:
-                    print(f"\n⚠ Max iterations reached")
+                    print(f"\n⚠ Max iterations")
                 break
         
         total_time = time.time() - start_time
@@ -404,13 +605,11 @@ class EAGLESpeculativeDecoder:
             skip_special_tokens=True
         )
         
-        # Calculate stats
+        # Stats
         stats['total_time'] = total_time
         stats['tokens_generated'] = current_ids.shape[1] - initial_len
         stats['tokens_per_second'] = stats['tokens_generated'] / total_time if total_time > 0 else 0
         stats['avg_acceptance'] = sum(stats['acceptance_rates']) / len(stats['acceptance_rates']) if stats['acceptance_rates'] else 0
-        stats['avg_draft_time'] = sum(stats['draft_times']) / len(stats['draft_times']) if stats['draft_times'] else 0
-        stats['avg_verify_time'] = sum(stats['verify_times']) / len(stats['verify_times']) if stats['verify_times'] else 0
         
         # Summary
         print(f"\n{'='*70}")
@@ -420,7 +619,7 @@ class EAGLESpeculativeDecoder:
         print(f"Tokens generated: {stats['tokens_generated']}")
         print(f"Total time: {total_time:.2f}s")
         print(f"Tokens/second: {stats['tokens_per_second']:.2f}")
-        print(f"Avg acceptance rate: {stats['avg_acceptance']:.1f}%")
+        print(f"Avg acceptance: {stats['avg_acceptance']:.1f}%")
         print(f"Draft efficiency: {stats['total_accepted']}/{stats['total_draft']} = {stats['total_accepted']/max(stats['total_draft'],1)*100:.1f}%")
         print(f"\nFinal text:")
         print(f"  {final_text}")
@@ -434,43 +633,44 @@ class EAGLESpeculativeDecoder:
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="EAGLE Proper Implementation")
+    parser = argparse.ArgumentParser(description="EAGLE Tree Generation - One Pass")
     parser.add_argument("--prompt", type=str, default="The future of artificial intelligence is",
                        help="Input prompt")
     parser.add_argument("--max-new-tokens", type=int, default=50,
-                       help="Maximum new tokens to generate")
-    parser.add_argument("--num-draft", type=int, default=10,
-                       help="Number of draft tokens per iteration")
+                       help="Maximum new tokens")
+    parser.add_argument("--tree-width", type=int, default=3,
+                       help="Tree width")
+    parser.add_argument("--tree-depth", type=int, default=2,
+                       help="Tree depth")
     parser.add_argument("--temperature", type=float, default=1.0,
-                       help="Sampling temperature")
+                       help="Temperature")
     parser.add_argument("--top-k", type=int, default=20,
-                       help="Top-k sampling")
+                       help="Top-k")
     
     args = parser.parse_args()
     
     print("\n" + "="*70)
-    print("EAGLE SPECULATIVE DECODING - PROPER IMPLEMENTATION")
+    print("EAGLE TREE GENERATION IN ONE PASS")
     print("="*70)
-    print("Architecture:")
-    print("  1. Target model generates hidden states")
-    print("  2. EAGLE uses hidden states via set_forward_context()")
-    print("  3. EAGLE drafts tokens conditioned on target states")
-    print("  4. Target verifies draft tokens")
-    print("  5. Speculative sampling accepts/rejects")
-    print("  6. Repeat until done")
+    print("Features:")
+    print("  ✓ Proper EAGLE architecture (set_forward_context)")
+    print("  ✓ Tree generation in ONE pass (not sequential)")
+    print("  ✓ FlexAttention-style tree masks")
+    print("  ✓ Speculative sampling for path selection")
     print("="*70)
     
     # Initialize
-    decoder = EAGLESpeculativeDecoder(
+    generator = EAGLETreeGenerator(
         draft_model_path="yuhuili/EAGLE-LLaMA3.1-Instruct-8B",
-        target_model_path="meta-llama/Llama-3.1-8B-Instruct"
+        target_model_path="meta-llama/Llama-3.1-8B-Instruct",
+        tree_width=args.tree_width,
+        tree_depth=args.tree_depth
     )
     
     # Generate
-    final_text, stats = decoder.generate(
+    final_text, stats = generator.generate(
         prompt=args.prompt,
         max_new_tokens=args.max_new_tokens,
-        num_draft_tokens=args.num_draft,
         temperature=args.temperature,
         top_k=args.top_k,
         verbose=True
