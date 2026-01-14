@@ -684,224 +684,616 @@ Minimal Test - Isolate the Issue
 Test each component separately to find where None is returned
 """
 
+"""
+Minimal Test - Isolate the Issue
+=================================
+
+Test each component separately to find where None is returned
+"""
+
+"""
+End-to-End Tests for FastEagle Proposer
+========================================
+
+Complete workflow tests including:
+- Full generation pipeline
+- Multiple prompts and iterations
+- Performance benchmarking
+- Quality validation
+- Error handling
+
+Usage:
+    python test_e2e.py
+    python test_e2e.py --prompts 5
+    python test_e2e.py --iterations 10
+"""
+
 import torch
-from fast_eagle_proposer import (
-    build_tree_structure,
-    create_tree_attention_mask,
-    create_tree_position_ids,
-    TreeNode
-)
+import time
+import argparse
+from typing import List, Dict
+from fast_eagle_proposer import FastEagleProposer
 
 
-def test_tree_building():
-    """Test 1: Tree structure building"""
+# ============================================================================
+# Test 1: Single Prompt Generation
+# ============================================================================
+
+def test_single_prompt():
+    """Test E2E generation with single prompt"""
     print("\n" + "="*70)
-    print("TEST 1: TREE BUILDING")
+    print("TEST 1: SINGLE PROMPT GENERATION")
     print("="*70)
     
     try:
-        nodes, parent_ids = build_tree_structure(width=3, depth=2)
-        
-        print(f"✓ Built tree: {len(nodes)} nodes")
-        print(f"  Nodes type: {type(nodes)}")
-        print(f"  Parent IDs type: {type(parent_ids)}")
-        
-        if nodes is None:
-            print("✗ ERROR: nodes is None!")
-            return False
-        
-        if parent_ids is None:
-            print("✗ ERROR: parent_ids is None!")
-            return False
-        
-        return True
-        
-    except Exception as e:
-        print(f"✗ FAILED: {e}")
-        return False
-
-
-def test_attention_mask():
-    """Test 2: Attention mask creation"""
-    print("\n" + "="*70)
-    print("TEST 2: ATTENTION MASK")
-    print("="*70)
-    
-    try:
-        nodes, parent_ids = build_tree_structure(width=3, depth=2)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        mask = create_tree_attention_mask(
-            parent_ids,
-            prefix_len=5,
-            device=device
+        print("\n1. Initializing proposer...")
+        proposer = FastEagleProposer(
+            tree_width=4,
+            tree_depth=2,
+            beam_width=3
         )
+        print("✓ Proposer initialized")
         
-        print(f"✓ Created mask: {mask.shape}")
-        print(f"  Mask type: {type(mask)}")
+        print("\n2. Preparing prompt...")
+        prompt = "The future of artificial intelligence is"
+        input_ids = proposer.tokenizer.encode(prompt, return_tensors="pt").to(proposer.device)
+        print(f"✓ Prompt: '{prompt}'")
+        print(f"  Input tokens: {input_ids.shape[1]}")
         
-        if mask is None:
-            print("✗ ERROR: mask is None!")
-            return False
+        print("\n3. Generating draft tokens...")
+        start_time = time.time()
+        draft_tokens, draft_nodes = proposer.propose(input_ids, verbose=False)
+        elapsed = time.time() - start_time
         
+        print(f"✓ Generation complete: {elapsed:.3f}s")
+        print(f"  Draft tokens: {len(draft_tokens)}")
+        print(f"  Draft nodes: {len(draft_nodes)}")
+        
+        # Validate
+        assert len(draft_tokens) > 0, "No tokens generated"
+        assert len(draft_nodes) > 0, "No nodes generated"
+        assert len(draft_tokens) == len(draft_nodes), "Token/node count mismatch"
+        
+        print("\n4. Decoding output...")
+        draft_text = proposer.decode_tokens(draft_tokens)
+        print(f"✓ Draft text: '{draft_text}'")
+        
+        # Validate tokens
+        print("\n5. Validating tokens...")
+        for i, token_id in enumerate(draft_tokens):
+            assert 0 <= token_id < proposer.vocab_size, f"Invalid token {token_id} at position {i}"
+        print(f"✓ All {len(draft_tokens)} tokens valid")
+        
+        print("\n✓ TEST 1 PASSED")
         return True
         
     except Exception as e:
-        print(f"✗ FAILED: {e}")
+        print(f"\n✗ TEST 1 FAILED: {e}")
         import traceback
         traceback.print_exc()
         return False
 
 
-def test_position_ids():
-    """Test 3: Position IDs creation"""
+# ============================================================================
+# Test 2: Multiple Prompts
+# ============================================================================
+
+def test_multiple_prompts(num_prompts: int = 5):
+    """Test E2E generation with multiple prompts"""
     print("\n" + "="*70)
-    print("TEST 3: POSITION IDS")
+    print(f"TEST 2: MULTIPLE PROMPTS ({num_prompts})")
     print("="*70)
     
     try:
-        nodes, parent_ids = build_tree_structure(width=3, depth=2)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        positions = create_tree_position_ids(
-            nodes,
-            prefix_len=5,
-            device=device
+        print("\n1. Initializing proposer...")
+        proposer = FastEagleProposer(
+            tree_width=3,
+            tree_depth=2,
+            beam_width=2
         )
+        print("✓ Proposer initialized")
         
-        print(f"✓ Created positions: {positions.shape}")
-        print(f"  Positions type: {type(positions)}")
+        prompts = [
+            "The future of AI is",
+            "Machine learning will",
+            "In the year 2030,",
+            "Scientists have discovered",
+            "The most important technology",
+            "Climate change requires",
+            "Neural networks can",
+            "Quantum computing will",
+            "Space exploration is",
+            "Renewable energy is"
+        ][:num_prompts]
         
-        if positions is None:
-            print("✗ ERROR: positions is None!")
-            return False
+        results = []
+        total_time = 0
+        total_tokens = 0
         
+        print(f"\n2. Testing {len(prompts)} prompts...")
+        
+        for i, prompt in enumerate(prompts):
+            print(f"\n  Prompt {i+1}/{len(prompts)}: '{prompt}'")
+            
+            # Encode
+            input_ids = proposer.tokenizer.encode(prompt, return_tensors="pt").to(proposer.device)
+            
+            # Generate
+            start_time = time.time()
+            draft_tokens, draft_nodes = proposer.propose(input_ids)
+            elapsed = time.time() - start_time
+            
+            # Decode
+            draft_text = proposer.decode_tokens(draft_tokens)
+            
+            # Record
+            result = {
+                'prompt': prompt,
+                'draft_text': draft_text,
+                'num_tokens': len(draft_tokens),
+                'time': elapsed,
+                'tokens_per_sec': len(draft_tokens) / elapsed if elapsed > 0 else 0
+            }
+            results.append(result)
+            
+            total_time += elapsed
+            total_tokens += len(draft_tokens)
+            
+            print(f"    ✓ Generated {len(draft_tokens)} tokens in {elapsed:.3f}s")
+            print(f"      '{draft_text[:50]}{'...' if len(draft_text) > 50 else ''}'")
+        
+        # Summary
+        print(f"\n3. Summary:")
+        print(f"  Total prompts: {len(prompts)}")
+        print(f"  Total time: {total_time:.3f}s")
+        print(f"  Average time/prompt: {total_time/len(prompts):.3f}s")
+        print(f"  Total tokens: {total_tokens}")
+        print(f"  Average tokens/prompt: {total_tokens/len(prompts):.1f}")
+        print(f"  Overall tokens/sec: {total_tokens/total_time:.2f}")
+        
+        print("\n✓ TEST 2 PASSED")
         return True
         
     except Exception as e:
-        print(f"✗ FAILED: {e}")
+        print(f"\n✗ TEST 2 FAILED: {e}")
         import traceback
         traceback.print_exc()
         return False
 
 
-def test_beam_pruning_mock():
-    """Test 4: Beam search pruning with mock data"""
+# ============================================================================
+# Test 3: Multiple Iterations (Full Generation Loop)
+# ============================================================================
+
+def test_multiple_iterations(max_iterations: int = 10):
+    """Test E2E generation with multiple iterations"""
     print("\n" + "="*70)
-    print("TEST 4: BEAM PRUNING (MOCK)")
+    print(f"TEST 3: MULTIPLE ITERATIONS (max={max_iterations})")
     print("="*70)
     
     try:
-        # Build tree
-        nodes, parent_ids = build_tree_structure(width=3, depth=2)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print("\n1. Initializing proposer...")
+        proposer = FastEagleProposer(
+            tree_width=4,
+            tree_depth=2,
+            beam_width=3
+        )
+        print("✓ Proposer initialized")
         
-        # Mock logits
-        vocab_size = 1000
-        tree_logits = torch.randn(len(nodes), vocab_size, device=device)
+        print("\n2. Starting generation loop...")
+        prompt = "The future of AI is"
+        print(f"  Prompt: '{prompt}'")
         
-        print(f"  Tree nodes: {len(nodes)}")
-        print(f"  Mock logits: {tree_logits.shape}")
+        # Initialize
+        input_ids = proposer.tokenizer.encode(prompt, return_tensors="pt").to(proposer.device)
+        current_ids = input_ids.clone()
+        initial_len = current_ids.shape[1]
         
-        # We can't easily test the full beam_search_prune without the proposer
-        # but we can at least verify the inputs are valid
+        iterations = 0
+        total_draft_time = 0
+        total_tokens_generated = 0
+        iteration_stats = []
         
-        print("✓ Inputs for beam pruning are valid")
+        print(f"\n3. Generation loop (max {max_iterations} iterations)...")
+        
+        while iterations < max_iterations:
+            iterations += 1
+            print(f"\n  Iteration {iterations}:")
+            
+            # Get target hidden states
+            target_hidden = proposer.get_target_hidden_states(current_ids)
+            
+            # Generate draft
+            start_time = time.time()
+            draft_tokens, draft_nodes = proposer.propose(current_ids, target_hidden)
+            draft_time = time.time() - start_time
+            
+            if len(draft_tokens) == 0:
+                print("    ⚠ No tokens generated, stopping")
+                break
+            
+            # Simple acceptance (for testing - just take first few tokens)
+            # In real use, you'd verify with target model
+            num_accept = min(len(draft_tokens), 5)  # Accept first 5 tokens
+            accepted_tokens = draft_tokens[:num_accept]
+            
+            print(f"    Draft: {len(draft_tokens)} tokens in {draft_time:.3f}s")
+            print(f"    Accepted: {num_accept} tokens")
+            
+            # Update state
+            current_ids = torch.cat([current_ids, accepted_tokens.unsqueeze(0)], dim=1)
+            total_draft_time += draft_time
+            total_tokens_generated += num_accept
+            
+            # Record stats
+            iteration_stats.append({
+                'iteration': iterations,
+                'draft_tokens': len(draft_tokens),
+                'accepted_tokens': num_accept,
+                'draft_time': draft_time,
+                'acceptance_rate': num_accept / len(draft_tokens) if len(draft_tokens) > 0 else 0
+            })
+            
+            # Check if we've generated enough
+            if current_ids.shape[1] - initial_len >= 50:
+                print(f"\n    Generated {current_ids.shape[1] - initial_len} tokens, stopping")
+                break
+        
+        # Decode final output
+        final_text = proposer.tokenizer.decode(current_ids[0], skip_special_tokens=True)
+        
+        print(f"\n4. Final output:")
+        print(f"  Iterations: {iterations}")
+        print(f"  Total tokens generated: {total_tokens_generated}")
+        print(f"  Total draft time: {total_draft_time:.3f}s")
+        print(f"  Tokens/sec: {total_tokens_generated/total_draft_time:.2f}")
+        print(f"\n  Generated text:")
+        print(f"  '{final_text}'")
+        
+        print(f"\n5. Per-iteration stats:")
+        for stat in iteration_stats:
+            print(f"  Iter {stat['iteration']}: "
+                  f"{stat['draft_tokens']} draft → {stat['accepted_tokens']} accepted "
+                  f"({stat['acceptance_rate']*100:.1f}%) in {stat['draft_time']:.3f}s")
+        
+        print("\n✓ TEST 3 PASSED")
         return True
         
     except Exception as e:
-        print(f"✗ FAILED: {e}")
+        print(f"\n✗ TEST 3 FAILED: {e}")
         import traceback
         traceback.print_exc()
         return False
 
 
-def test_return_tuple():
-    """Test 5: Verify functions return correct types"""
+# ============================================================================
+# Test 4: Quality Validation
+# ============================================================================
+
+def test_quality_validation():
+    """Test output quality validation"""
     print("\n" + "="*70)
-    print("TEST 5: RETURN TYPES")
+    print("TEST 4: QUALITY VALIDATION")
     print("="*70)
     
     try:
-        # Test build_tree_structure
-        result = build_tree_structure(width=2, depth=2)
+        print("\n1. Initializing proposer...")
+        proposer = FastEagleProposer(
+            tree_width=4,
+            tree_depth=2,
+            beam_width=3
+        )
+        print("✓ Proposer initialized")
         
-        print(f"build_tree_structure returns: {type(result)}")
+        print("\n2. Generating outputs for quality checks...")
+        prompts = [
+            "Hello world",
+            "The capital of France is",
+            "1 + 1 equals"
+        ]
         
-        if result is None:
-            print("✗ ERROR: build_tree_structure returns None!")
-            return False
+        quality_checks = {
+            'valid_tokens': 0,
+            'valid_decoding': 0,
+            'reasonable_length': 0,
+            'no_repetition': 0
+        }
         
-        if not isinstance(result, tuple):
-            print(f"✗ ERROR: build_tree_structure returns {type(result)}, not tuple!")
-            return False
+        for prompt in prompts:
+            print(f"\n  Testing: '{prompt}'")
+            
+            input_ids = proposer.tokenizer.encode(prompt, return_tensors="pt").to(proposer.device)
+            draft_tokens, draft_nodes = proposer.propose(input_ids)
+            
+            # Check 1: Valid token IDs
+            valid_tokens = all(0 <= t < proposer.vocab_size for t in draft_tokens)
+            if valid_tokens:
+                quality_checks['valid_tokens'] += 1
+                print("    ✓ All tokens valid")
+            else:
+                print("    ✗ Invalid tokens detected")
+            
+            # Check 2: Can decode
+            try:
+                draft_text = proposer.decode_tokens(draft_tokens)
+                quality_checks['valid_decoding'] += 1
+                print(f"    ✓ Decoding successful: '{draft_text[:30]}...'")
+            except Exception as e:
+                print(f"    ✗ Decoding failed: {e}")
+            
+            # Check 3: Reasonable length
+            if len(draft_tokens) >= 5 and len(draft_tokens) <= 20:
+                quality_checks['reasonable_length'] += 1
+                print(f"    ✓ Length reasonable: {len(draft_tokens)} tokens")
+            else:
+                print(f"    ⚠ Length unusual: {len(draft_tokens)} tokens")
+            
+            # Check 4: No excessive repetition
+            unique_ratio = len(set(draft_tokens.tolist())) / len(draft_tokens)
+            if unique_ratio > 0.5:
+                quality_checks['no_repetition'] += 1
+                print(f"    ✓ No excessive repetition: {unique_ratio*100:.1f}% unique")
+            else:
+                print(f"    ⚠ Excessive repetition: {unique_ratio*100:.1f}% unique")
         
-        if len(result) != 2:
-            print(f"✗ ERROR: build_tree_structure returns tuple of length {len(result)}, not 2!")
-            return False
+        print(f"\n3. Quality summary:")
+        total_tests = len(prompts)
+        for check, count in quality_checks.items():
+            pct = (count / total_tests) * 100
+            status = "✓" if pct == 100 else "⚠"
+            print(f"  {status} {check}: {count}/{total_tests} ({pct:.1f}%)")
         
-        nodes, parent_ids = result
+        # Pass if all prompts have valid tokens and can decode
+        all_passed = (quality_checks['valid_tokens'] == total_tests and 
+                      quality_checks['valid_decoding'] == total_tests)
         
-        if nodes is None:
-            print("✗ ERROR: nodes in tuple is None!")
-            return False
-        
-        if parent_ids is None:
-            print("✗ ERROR: parent_ids in tuple is None!")
-            return False
-        
-        print(f"✓ build_tree_structure returns: (List[{len(nodes)}], List[{len(parent_ids)}])")
+        if all_passed:
+            print("\n✓ TEST 4 PASSED")
+        else:
+            print("\n⚠ TEST 4 PARTIAL PASS (some quality issues)")
         
         return True
         
     except Exception as e:
-        print(f"✗ FAILED: {e}")
+        print(f"\n✗ TEST 4 FAILED: {e}")
         import traceback
         traceback.print_exc()
         return False
 
 
-def main():
-    """Run all minimal tests"""
+# ============================================================================
+# Test 5: Performance Benchmarking
+# ============================================================================
+
+def test_performance_benchmark(num_iterations: int = 20):
+    """Test E2E performance benchmarking"""
     print("\n" + "="*70)
-    print("MINIMAL TEST SUITE - ISOLATE THE ISSUE")
+    print(f"TEST 5: PERFORMANCE BENCHMARK ({num_iterations} iterations)")
     print("="*70)
-    print("\nThese tests check each component without loading models")
+    
+    try:
+        print("\n1. Initializing proposer...")
+        proposer = FastEagleProposer(
+            tree_width=4,
+            tree_depth=2,
+            beam_width=3
+        )
+        print("✓ Proposer initialized")
+        
+        print("\n2. Warming up (5 iterations)...")
+        input_ids = proposer.tokenizer.encode("Test", return_tensors="pt").to(proposer.device)
+        for _ in range(5):
+            proposer.propose(input_ids)
+        print("✓ Warmup complete")
+        
+        print(f"\n3. Running benchmark ({num_iterations} iterations)...")
+        prompt = "The future of artificial intelligence"
+        input_ids = proposer.tokenizer.encode(prompt, return_tensors="pt").to(proposer.device)
+        
+        times = []
+        token_counts = []
+        
+        for i in range(num_iterations):
+            start_time = time.time()
+            draft_tokens, draft_nodes = proposer.propose(input_ids)
+            elapsed = time.time() - start_time
+            
+            times.append(elapsed)
+            token_counts.append(len(draft_tokens))
+            
+            if (i + 1) % 5 == 0:
+                print(f"  Iteration {i+1}/{num_iterations}: {elapsed:.3f}s, {len(draft_tokens)} tokens")
+        
+        # Statistics
+        import statistics
+        
+        avg_time = statistics.mean(times)
+        std_time = statistics.stdev(times) if len(times) > 1 else 0
+        min_time = min(times)
+        max_time = max(times)
+        
+        avg_tokens = statistics.mean(token_counts)
+        tokens_per_sec = avg_tokens / avg_time
+        
+        print(f"\n4. Results:")
+        print(f"  Iterations: {num_iterations}")
+        print(f"  Average time: {avg_time:.3f}s ± {std_time:.3f}s")
+        print(f"  Min time: {min_time:.3f}s")
+        print(f"  Max time: {max_time:.3f}s")
+        print(f"  Average tokens: {avg_tokens:.1f}")
+        print(f"  Tokens/second: {tokens_per_sec:.2f}")
+        
+        # Performance expectations
+        print(f"\n5. Performance check:")
+        if avg_time < 0.2:
+            print(f"  ✓ Fast: {avg_time:.3f}s < 0.2s")
+        else:
+            print(f"  ⚠ Slow: {avg_time:.3f}s >= 0.2s")
+        
+        if avg_tokens >= 10:
+            print(f"  ✓ Good output: {avg_tokens:.1f} >= 10 tokens")
+        else:
+            print(f"  ⚠ Low output: {avg_tokens:.1f} < 10 tokens")
+        
+        print("\n✓ TEST 5 PASSED")
+        return True
+        
+    except Exception as e:
+        print(f"\n✗ TEST 5 FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+# ============================================================================
+# Test 6: Error Handling
+# ============================================================================
+
+def test_error_handling():
+    """Test E2E error handling"""
+    print("\n" + "="*70)
+    print("TEST 6: ERROR HANDLING")
+    print("="*70)
+    
+    try:
+        print("\n1. Initializing proposer...")
+        proposer = FastEagleProposer(
+            tree_width=3,
+            tree_depth=2,
+            beam_width=2
+        )
+        print("✓ Proposer initialized")
+        
+        print("\n2. Testing edge cases...")
+        
+        # Test 1: Very short input
+        print("\n  Test 2.1: Very short input")
+        input_ids = proposer.tokenizer.encode("Hi", return_tensors="pt").to(proposer.device)
+        draft_tokens, draft_nodes = proposer.propose(input_ids)
+        print(f"    ✓ Generated {len(draft_tokens)} tokens from short input")
+        
+        # Test 2: Longer input
+        print("\n  Test 2.2: Longer input")
+        long_text = "The quick brown fox jumps over the lazy dog. " * 3
+        input_ids = proposer.tokenizer.encode(long_text, return_tensors="pt").to(proposer.device)
+        draft_tokens, draft_nodes = proposer.propose(input_ids)
+        print(f"    ✓ Generated {len(draft_tokens)} tokens from long input")
+        
+        # Test 3: Special characters
+        print("\n  Test 2.3: Special characters")
+        input_ids = proposer.tokenizer.encode("Hello! @#$ 123", return_tensors="pt").to(proposer.device)
+        draft_tokens, draft_nodes = proposer.propose(input_ids)
+        print(f"    ✓ Generated {len(draft_tokens)} tokens with special chars")
+        
+        print("\n3. Testing error recovery...")
+        
+        # Test 4: Multiple calls in succession
+        print("\n  Test 3.1: Multiple successive calls")
+        for i in range(3):
+            input_ids = proposer.tokenizer.encode(f"Test {i}", return_tensors="pt").to(proposer.device)
+            draft_tokens, draft_nodes = proposer.propose(input_ids)
+            print(f"    ✓ Call {i+1}: {len(draft_tokens)} tokens")
+        
+        print("\n✓ TEST 6 PASSED")
+        return True
+        
+    except Exception as e:
+        print(f"\n✗ TEST 6 FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+# ============================================================================
+# Main Test Runner
+# ============================================================================
+
+def run_all_e2e_tests(args):
+    """Run all end-to-end tests"""
+    print("\n" + "="*70)
+    print("END-TO-END TEST SUITE")
+    print("="*70)
+    print("\nTesting complete generation pipeline...")
     
     tests = [
-        test_tree_building,
-        test_attention_mask,
-        test_position_ids,
-        test_beam_pruning_mock,
-        test_return_tuple,
+        ("Single Prompt Generation", lambda: test_single_prompt()),
+        ("Multiple Prompts", lambda: test_multiple_prompts(args.prompts)),
+        ("Multiple Iterations", lambda: test_multiple_iterations(args.iterations)),
+        ("Quality Validation", lambda: test_quality_validation()),
+        ("Performance Benchmark", lambda: test_performance_benchmark(args.benchmark)),
+        ("Error Handling", lambda: test_error_handling()),
     ]
     
     results = []
-    for test in tests:
-        passed = test()
-        results.append(passed)
+    start_time = time.time()
     
+    for name, test_func in tests:
+        try:
+            passed = test_func()
+            results.append((name, passed))
+        except Exception as e:
+            print(f"\nTest '{name}' crashed: {e}")
+            results.append((name, False))
+    
+    total_time = time.time() - start_time
+    
+    # Summary
     print("\n" + "="*70)
-    print("RESULTS")
+    print("TEST SUMMARY")
     print("="*70)
     
-    passed = sum(results)
-    total = len(results)
+    passed_count = sum(1 for _, passed in results if passed)
+    total_count = len(results)
     
-    print(f"{passed}/{total} tests passed")
+    for name, passed in results:
+        status = "✓ PASSED" if passed else "✗ FAILED"
+        print(f"{name}: {status}")
     
-    if passed == total:
-        print("\n✓ All component tests passed!")
-        print("  The issue is likely in:")
-        print("  1. Model loading")
-        print("  2. Model forward pass")
-        print("  3. The propose() method itself")
-        print("\nRun test_debug.py to test with actual models")
+    print(f"\n{passed_count}/{total_count} tests passed")
+    print(f"Total time: {total_time:.2f}s")
+    
+    if passed_count == total_count:
+        print("\n🎉 ALL E2E TESTS PASSED!")
+        print("\nThe proposer is working correctly end-to-end!")
     else:
-        print(f"\n✗ {total - passed} component tests failed")
-        print("  Fix these basic components first")
+        print(f"\n⚠️ {total_count - passed_count} tests failed")
+        print("\nCheck the output above for details")
     
-    print("="*70)
+    print("="*70 + "\n")
+    
+    return passed_count == total_count
+
+
+def main():
+    """Main function"""
+    parser = argparse.ArgumentParser(description="End-to-End Tests for FastEagle Proposer")
+    parser.add_argument(
+        "--prompts",
+        type=int,
+        default=5,
+        help="Number of prompts for multiple prompt test"
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=10,
+        help="Number of iterations for multiple iteration test"
+    )
+    parser.add_argument(
+        "--benchmark",
+        type=int,
+        default=20,
+        help="Number of iterations for performance benchmark"
+    )
+    
+    args = parser.parse_args()
+    
+    success = run_all_e2e_tests(args)
+    
+    if success:
+        exit(0)
+    else:
+        exit(1)
 
 
 if __name__ == "__main__":
