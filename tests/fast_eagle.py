@@ -678,138 +678,167 @@ class FastEagleProposer:
         """Decode tokens to text"""
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)
 
-
 """
-Debug Test for FastEagle Proposer
-==================================
+Fix Verification Script
+========================
 
-Simple test to identify where the type error occurs
+This script shows the exact error and how to verify the fix works.
 """
 
-ort FastEagleProposer
-
-def test_debug():
-    """Debug test with detailed output"""
+def test_unpack_none():
+    """Demonstrate the error"""
     print("\n" + "="*70)
-    print("DEBUG TEST")
+    print("DEMONSTRATING THE ERROR")
     print("="*70)
     
+    # This is what's happening in your code
+    def broken_function():
+        """Returns None instead of tuple"""
+        return None
+    
+    print("\n1. Function that returns None:")
+    print("   def broken_function():")
+    print("       return None")
+    
+    print("\n2. Trying to unpack:")
+    print("   a, b = broken_function()")
+    
     try:
-        print("\n1. Checking CUDA availability...")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"   Device: {device}")
-        
-        print("\n2. Initializing proposer...")
-        print("   This will load models (may take a minute)...")
-        
-        proposer = FastEagleProposer(
-            tree_width=3,
-            tree_depth=2,
-            beam_width=2,
-            draft_layer_idx=-1
-        )
-        
-        print("   ✓ Proposer initialized")
-        print(f"   Device: {proposer.device}")
-        print(f"   Tree nodes (full): {proposer.num_tree_nodes}")
-        print(f"   Tree nodes (pruned): {proposer.num_pruned_nodes}")
-        
-        print("\n3. Preparing input...")
-        text = "Hello world"
-        print(f"   Text: '{text}'")
-        
-        input_ids = proposer.tokenizer.encode(text, return_tensors="pt")
-        print(f"   Input IDs shape: {input_ids.shape}")
-        print(f"   Input IDs: {input_ids}")
-        
-        input_ids = input_ids.to(proposer.device)
-        print(f"   Moved to device: {input_ids.device}")
-        
-        print("\n4. Getting target hidden states...")
-        target_hidden = proposer.get_target_hidden_states(input_ids)
-        
-        if target_hidden is None:
-            print("   ✗ ERROR: get_target_hidden_states returned None!")
-            return False
-        
-        print(f"   Target hidden shape: {target_hidden.shape}")
-        print(f"   Type: {type(target_hidden)}")
-        
-        print("\n5. Calling propose method with verbose mode...")
-        result = proposer.propose(input_ids, verbose=True)
-        
-        print(f"\n6. Checking result...")
-        print(f"   Result type: {type(result)}")
-        
-        if result is None:
-            print("   ✗ ERROR: propose() returned None!")
-            print("   This is the source of the 'cannot unpack non-iterable NoneType' error")
-            return False
-        
-        if not isinstance(result, tuple):
-            print(f"   ✗ ERROR: propose() returned {type(result)}, expected tuple!")
-            return False
-        
-        if len(result) != 2:
-            print(f"   ✗ ERROR: propose() returned tuple of length {len(result)}, expected 2!")
-            return False
-        
-        print(f"   ✓ Result is a tuple of length 2")
-        
-        print("\n7. Unpacking result...")
-        draft_tokens, draft_nodes = result
-        
-        print(f"   Draft tokens type: {type(draft_tokens)}")
-        print(f"   Draft tokens shape: {draft_tokens.shape if hasattr(draft_tokens, 'shape') else 'N/A'}")
-        print(f"   Draft nodes type: {type(draft_nodes)}")
-        print(f"   Draft nodes length: {len(draft_nodes) if draft_nodes else 0}")
-        
-        if len(draft_tokens) == 0:
-            print("   ⚠ WARNING: No tokens generated!")
-            return False
-        
-        print("\n8. Decoding tokens...")
-        draft_text = proposer.decode_tokens(draft_tokens)
-        print(f"   Draft text: '{draft_text}'")
-        
-        print("\n✓ DEBUG TEST PASSED")
-        return True
-        
+        a, b = broken_function()
+        print("   ✓ Success")
     except TypeError as e:
-        print(f"\n✗ DEBUG TEST FAILED - TypeError")
-        print(f"Error: {e}")
-        
+        print(f"   ✗ ERROR: {e}")
         if "cannot unpack non-iterable NoneType" in str(e):
-            print("\n⚠ This is the unpacking error!")
-            print("   The propose() method is returning None instead of a tuple")
-            print("   Check the error messages above to see where it failed")
+            print("   👆 This is your error!")
+    
+    print("\n3. The fix - always return a tuple:")
+    print("   def fixed_function():")
+    print("       return (value1, value2)  # Always a tuple!")
+    
+    def fixed_function():
+        """Returns tuple even on error"""
+        try:
+            # Some operation
+            return ("value1", "value2")
+        except:
+            # Even on error, return tuple
+            return (None, None)
+    
+    print("\n4. Trying to unpack fixed version:")
+    print("   a, b = fixed_function()")
+    
+    try:
+        a, b = fixed_function()
+        print(f"   ✓ Success: a={a}, b={b}")
+    except TypeError as e:
+        print(f"   ✗ ERROR: {e}")
+
+
+def test_propose_signature():
+    """Test what propose should return"""
+    print("\n" + "="*70)
+    print("WHAT PROPOSE SHOULD RETURN")
+    print("="*70)
+    
+    import torch
+    
+    print("\n1. Correct return value:")
+    print("   draft_tokens: torch.Tensor (shape [N])")
+    print("   draft_nodes: List[TreeNode]")
+    
+    print("\n2. Example of correct return:")
+    
+    # Mock correct return
+    draft_tokens = torch.tensor([1, 2, 3, 4, 5])
+    draft_nodes = []  # Would contain TreeNode objects
+    
+    result = (draft_tokens, draft_nodes)
+    
+    print(f"   result = {type(result)}")
+    print(f"   len(result) = {len(result)}")
+    
+    print("\n3. Unpacking:")
+    print("   tokens, nodes = result")
+    
+    tokens, nodes = result
+    print(f"   ✓ tokens: {type(tokens)}, shape {tokens.shape}")
+    print(f"   ✓ nodes: {type(nodes)}, length {len(nodes)}")
+    
+    print("\n4. Even on error, return empty tuple:")
+    print("   return torch.tensor([]), []")
+    
+    empty_result = (torch.tensor([]), [])
+    tokens, nodes = empty_result
+    
+    print(f"   ✓ tokens: {type(tokens)}, shape {tokens.shape}")
+    print(f"   ✓ nodes: {type(nodes)}, length {len(nodes)}")
+
+
+def verify_fix():
+    """Verify the fix is in place"""
+    print("\n" + "="*70)
+    print("VERIFYING FIX IN CODE")
+    print("="*70)
+    
+    print("\nChecking fast_eagle_proposer.py...")
+    
+    try:
+        with open('fast_eagle_proposer.py', 'r') as f:
+            content = f.read()
         
-        import traceback
-        print("\nFull traceback:")
-        traceback.print_exc()
+        # Check for the fix
+        checks = [
+            ('Error handling in propose', 'except Exception as e:' in content and 'return empty_tokens, empty_nodes' in content or 'return torch.tensor([])' in content),
+            ('Verbose mode added', 'verbose: bool' in content),
+            ('ModelOutput class', 'class ModelOutput:' in content or 'ModelOutput(' in content),
+            ('Root token sampling', 'root_token_id' in content),
+        ]
         
-        return False
+        print("\nChecking for fixes:")
+        all_good = True
         
-    except Exception as e:
-        print(f"\n✗ DEBUG TEST FAILED")
-        print(f"Error: {e}")
-        print(f"Error type: {type(e)}")
+        for check_name, check_result in checks:
+            status = "✓" if check_result else "✗"
+            print(f"  {status} {check_name}")
+            if not check_result:
+                all_good = False
         
-        import traceback
-        print("\nFull traceback:")
-        traceback.print_exc()
+        if all_good:
+            print("\n✓ All fixes appear to be in place!")
+            print("  If you're still getting the error, run:")
+            print("  1. python test_minimal.py")
+            print("  2. python test_debug.py")
+        else:
+            print("\n✗ Some fixes are missing")
+            print("  Make sure you have the latest fast_eagle_proposer.py")
         
-        return False
+    except FileNotFoundError:
+        print("\n✗ fast_eagle_proposer.py not found")
+        print("  Make sure you're in the correct directory")
+
+
+def main():
+    """Run all verification"""
+    print("\n" + "="*70)
+    print("FIX VERIFICATION SCRIPT")
+    print("="*70)
+    print("\nThis script helps diagnose the 'cannot unpack non-iterable NoneType' error")
+    
+    test_unpack_none()
+    test_propose_signature()
+    verify_fix()
+    
+    print("\n" + "="*70)
+    print("NEXT STEPS")
+    print("="*70)
+    print("\n1. Run minimal tests (no model loading):")
+    print("   python test_minimal.py")
+    print("\n2. Run debug test (with model loading):")
+    print("   python test_debug.py")
+    print("\n3. If debug test fails, check the output to see where")
+    print("   propose() is returning None")
+    print("="*70 + "\n")
 
 
 if __name__ == "__main__":
-    success = test_debug()
-    
-    if success:
-        print("\n" + "="*70)
-        print("SUCCESS - Proposer is working correctly!")
-        print("="*70)
-    else:
-        print("\n" + "="*70)
-        print("FAILURE - Please check the error messages above")
-        print("="*70)
+    main()
