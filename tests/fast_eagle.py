@@ -138,40 +138,69 @@ class SingleLayerLLaMA(torch.nn.Module):
         Returns:
             Model outputs
         """
-        # Embed tokens
-        hidden_states = self.embed_tokens(input_ids)
-        
-        # If we have target hidden states, use them for conditioning
-        if self.target_hidden_states is not None:
-            batch_size, prefix_len, hidden_dim = self.target_hidden_states.shape
+        try:
+            # Embed tokens
+            hidden_states = self.embed_tokens(input_ids)
             
-            # Replace prefix embeddings with target hidden states
-            hidden_states[:, :prefix_len, :] = self.target_hidden_states
-        
-        # Pass through single layer
-        layer_outputs = self.layer(
-            hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            use_cache=use_cache
-        )
-        
-        hidden_states = layer_outputs[0]
-        
-        # Normalize
-        hidden_states = self.norm(hidden_states)
-        
-        # LM head
-        logits = self.lm_head(hidden_states)
-        
-        # Return
-        if return_dict:
-            return type('Output', (), {
-                'last_hidden_state': hidden_states,
-                'logits': logits
-            })()
-        else:
-            return (logits,)
+            if hidden_states is None:
+                raise ValueError("embed_tokens returned None")
+            
+            # If we have target hidden states, use them for conditioning
+            if self.target_hidden_states is not None:
+                batch_size, prefix_len, hidden_dim = self.target_hidden_states.shape
+                
+                # Replace prefix embeddings with target hidden states
+                hidden_states[:, :prefix_len, :] = self.target_hidden_states
+            
+            # Pass through single layer
+            layer_outputs = self.layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=use_cache
+            )
+            
+            if layer_outputs is None:
+                raise ValueError("Layer forward returned None")
+            
+            # Extract hidden states from layer output
+            if isinstance(layer_outputs, tuple):
+                hidden_states = layer_outputs[0]
+            else:
+                hidden_states = layer_outputs
+            
+            if hidden_states is None:
+                raise ValueError("Layer output hidden_states is None")
+            
+            # Normalize
+            hidden_states = self.norm(hidden_states)
+            
+            if hidden_states is None:
+                raise ValueError("norm returned None")
+            
+            # LM head
+            logits = self.lm_head(hidden_states)
+            
+            if logits is None:
+                raise ValueError("lm_head returned None")
+            
+            # Return
+            if return_dict:
+                # Create a simple object with the attributes we need
+                class ModelOutput:
+                    def __init__(self, last_hidden_state, logits):
+                        self.last_hidden_state = last_hidden_state
+                        self.logits = logits
+                
+                return ModelOutput(hidden_states, logits)
+            else:
+                return (logits,)
+                
+        except Exception as e:
+            print(f"Error in SingleLayerLLaMA.forward: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
 
 # ============================================================================
@@ -360,7 +389,8 @@ class FastEagleProposer:
     def propose(
         self,
         input_ids: torch.Tensor,
-        target_hidden_states: Optional[torch.Tensor] = None
+        target_hidden_states: Optional[torch.Tensor] = None,
+        verbose: bool = False
     ) -> Tuple[torch.Tensor, List[TreeNode]]:
         """
         Propose draft tokens using one-pass generation with single layer
@@ -368,27 +398,44 @@ class FastEagleProposer:
         Args:
             input_ids: Input token IDs [1, seq_len]
             target_hidden_states: Optional target hidden states
+            verbose: Print debug information
         
         Returns:
             draft_token_ids: Draft tokens
             draft_nodes: Draft tree nodes
         """
         try:
+            if verbose:
+                print("  [propose] Starting...")
+            
             batch_size, prefix_len = input_ids.shape
+            
+            if verbose:
+                print(f"  [propose] Input shape: {input_ids.shape}")
+            
             assert batch_size == 1, "Currently only supports batch_size=1"
             
             # Get target hidden states if not provided
             if target_hidden_states is None:
+                if verbose:
+                    print("  [propose] Getting target hidden states...")
                 target_hidden_states = self.get_target_hidden_states(input_ids)
             
             # Validate hidden states
             if target_hidden_states is None:
                 raise ValueError("Failed to get target hidden states")
             
+            if verbose:
+                print(f"  [propose] Target hidden shape: {target_hidden_states.shape}")
+            
             # Set forward context
+            if verbose:
+                print("  [propose] Setting forward context...")
             self.draft_model.set_forward_context(target_hidden_states)
             
             # Prepare input
+            if verbose:
+                print("  [propose] Preparing input...")
             tree_placeholders = torch.full(
                 (1, self.num_tree_nodes),
                 self.pad_token_id,
@@ -397,7 +444,12 @@ class FastEagleProposer:
             )
             full_input_ids = torch.cat([input_ids, tree_placeholders], dim=1)
             
+            if verbose:
+                print(f"  [propose] Full input shape: {full_input_ids.shape}")
+            
             # Create attention mask
+            if verbose:
+                print("  [propose] Creating attention mask...")
             attention_mask = create_tree_attention_mask(
                 self.parent_ids,
                 prefix_len,
@@ -406,6 +458,8 @@ class FastEagleProposer:
             )
             
             # Create position IDs
+            if verbose:
+                print("  [propose] Creating position IDs...")
             position_ids = create_tree_position_ids(
                 self.tree_nodes,
                 prefix_len,
@@ -413,6 +467,9 @@ class FastEagleProposer:
             )
             
             # ONE FORWARD PASS through SINGLE LAYER
+            if verbose:
+                print("  [propose] Running forward pass...")
+            
             outputs = self.draft_model(
                 input_ids=full_input_ids,
                 attention_mask=attention_mask,
@@ -421,11 +478,23 @@ class FastEagleProposer:
                 return_dict=True
             )
             
+            if verbose:
+                print(f"  [propose] Forward pass complete, outputs type: {type(outputs)}")
+            
             # Validate outputs
-            if outputs is None or not hasattr(outputs, 'logits'):
-                raise ValueError("Model forward pass failed to produce logits")
+            if outputs is None:
+                raise ValueError("Model forward pass returned None")
+            
+            if not hasattr(outputs, 'logits'):
+                raise ValueError(f"Model outputs missing 'logits' attribute. Has: {dir(outputs)}")
+            
+            if outputs.logits is None:
+                raise ValueError("Model outputs.logits is None")
             
             tree_logits = outputs.logits[0, prefix_len:, :]
+            
+            if verbose:
+                print(f"  [propose] Tree logits shape: {tree_logits.shape}")
             
             # Validate tree_logits
             if tree_logits.shape[0] != self.num_tree_nodes:
@@ -434,26 +503,44 @@ class FastEagleProposer:
                 )
             
             # Beam search pruning
+            if verbose:
+                print("  [propose] Running beam search pruning...")
+            
             pruned_nodes, draft_token_ids = self.beam_search_prune(
                 self.tree_nodes,
                 tree_logits
             )
             
+            if verbose:
+                print(f"  [propose] Pruning complete: {len(pruned_nodes)} nodes, {len(draft_token_ids)} tokens")
+            
             # Validate results
-            if pruned_nodes is None or draft_token_ids is None:
-                raise ValueError("Beam search pruning failed")
+            if pruned_nodes is None:
+                raise ValueError("beam_search_prune returned None for pruned_nodes")
+            
+            if draft_token_ids is None:
+                raise ValueError("beam_search_prune returned None for draft_token_ids")
             
             if len(pruned_nodes) == 0:
                 raise ValueError("No nodes were pruned")
             
+            if verbose:
+                print("  [propose] Success!")
+            
             return draft_token_ids, pruned_nodes
             
         except Exception as e:
-            print(f"Error in propose: {e}")
+            print(f"ERROR in propose: {e}")
             import traceback
             traceback.print_exc()
+            
             # Return empty results rather than None
-            return torch.tensor([], dtype=torch.long, device=self.device), []
+            empty_tokens = torch.tensor([], dtype=torch.long, device=self.device)
+            empty_nodes = []
+            
+            print(f"Returning empty results: tokens={type(empty_tokens)}, nodes={type(empty_nodes)}")
+            
+            return empty_tokens, empty_nodes
     
     def beam_search_prune(
         self,
@@ -599,6 +686,7 @@ Debug Test for FastEagle Proposer
 Simple test to identify where the type error occurs
 """
 
+ort FastEagleProposer
 
 def test_debug():
     """Debug test with detailed output"""
@@ -639,15 +727,23 @@ def test_debug():
         
         print("\n4. Getting target hidden states...")
         target_hidden = proposer.get_target_hidden_states(input_ids)
+        
+        if target_hidden is None:
+            print("   ✗ ERROR: get_target_hidden_states returned None!")
+            return False
+        
         print(f"   Target hidden shape: {target_hidden.shape}")
         print(f"   Type: {type(target_hidden)}")
         
-        print("\n5. Calling propose method...")
-        result = proposer.propose(input_ids)
+        print("\n5. Calling propose method with verbose mode...")
+        result = proposer.propose(input_ids, verbose=True)
+        
+        print(f"\n6. Checking result...")
         print(f"   Result type: {type(result)}")
         
         if result is None:
             print("   ✗ ERROR: propose() returned None!")
+            print("   This is the source of the 'cannot unpack non-iterable NoneType' error")
             return False
         
         if not isinstance(result, tuple):
@@ -660,7 +756,7 @@ def test_debug():
         
         print(f"   ✓ Result is a tuple of length 2")
         
-        print("\n6. Unpacking result...")
+        print("\n7. Unpacking result...")
         draft_tokens, draft_nodes = result
         
         print(f"   Draft tokens type: {type(draft_tokens)}")
@@ -668,15 +764,31 @@ def test_debug():
         print(f"   Draft nodes type: {type(draft_nodes)}")
         print(f"   Draft nodes length: {len(draft_nodes) if draft_nodes else 0}")
         
-        print("\n7. Decoding tokens...")
-        if len(draft_tokens) > 0:
-            draft_text = proposer.decode_tokens(draft_tokens)
-            print(f"   Draft text: '{draft_text}'")
-        else:
-            print("   No tokens to decode")
+        if len(draft_tokens) == 0:
+            print("   ⚠ WARNING: No tokens generated!")
+            return False
+        
+        print("\n8. Decoding tokens...")
+        draft_text = proposer.decode_tokens(draft_tokens)
+        print(f"   Draft text: '{draft_text}'")
         
         print("\n✓ DEBUG TEST PASSED")
         return True
+        
+    except TypeError as e:
+        print(f"\n✗ DEBUG TEST FAILED - TypeError")
+        print(f"Error: {e}")
+        
+        if "cannot unpack non-iterable NoneType" in str(e):
+            print("\n⚠ This is the unpacking error!")
+            print("   The propose() method is returning None instead of a tuple")
+            print("   Check the error messages above to see where it failed")
+        
+        import traceback
+        print("\nFull traceback:")
+        traceback.print_exc()
+        
+        return False
         
     except Exception as e:
         print(f"\n✗ DEBUG TEST FAILED")
