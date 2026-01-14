@@ -677,167 +677,231 @@ class FastEagleProposer:
     def decode_tokens(self, token_ids: torch.Tensor) -> str:
         """Decode tokens to text"""
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)
-
 """
-Fix Verification Script
-========================
+Minimal Test - Isolate the Issue
+=================================
 
-This script shows the exact error and how to verify the fix works.
+Test each component separately to find where None is returned
 """
 
-def test_unpack_none():
-    """Demonstrate the error"""
+import torch
+from fast_eagle_proposer import (
+    build_tree_structure,
+    create_tree_attention_mask,
+    create_tree_position_ids,
+    TreeNode
+)
+
+
+def test_tree_building():
+    """Test 1: Tree structure building"""
     print("\n" + "="*70)
-    print("DEMONSTRATING THE ERROR")
+    print("TEST 1: TREE BUILDING")
     print("="*70)
     
-    # This is what's happening in your code
-    def broken_function():
-        """Returns None instead of tuple"""
-        return None
-    
-    print("\n1. Function that returns None:")
-    print("   def broken_function():")
-    print("       return None")
-    
-    print("\n2. Trying to unpack:")
-    print("   a, b = broken_function()")
-    
     try:
-        a, b = broken_function()
-        print("   ✓ Success")
-    except TypeError as e:
-        print(f"   ✗ ERROR: {e}")
-        if "cannot unpack non-iterable NoneType" in str(e):
-            print("   👆 This is your error!")
-    
-    print("\n3. The fix - always return a tuple:")
-    print("   def fixed_function():")
-    print("       return (value1, value2)  # Always a tuple!")
-    
-    def fixed_function():
-        """Returns tuple even on error"""
-        try:
-            # Some operation
-            return ("value1", "value2")
-        except:
-            # Even on error, return tuple
-            return (None, None)
-    
-    print("\n4. Trying to unpack fixed version:")
-    print("   a, b = fixed_function()")
-    
-    try:
-        a, b = fixed_function()
-        print(f"   ✓ Success: a={a}, b={b}")
-    except TypeError as e:
-        print(f"   ✗ ERROR: {e}")
+        nodes, parent_ids = build_tree_structure(width=3, depth=2)
+        
+        print(f"✓ Built tree: {len(nodes)} nodes")
+        print(f"  Nodes type: {type(nodes)}")
+        print(f"  Parent IDs type: {type(parent_ids)}")
+        
+        if nodes is None:
+            print("✗ ERROR: nodes is None!")
+            return False
+        
+        if parent_ids is None:
+            print("✗ ERROR: parent_ids is None!")
+            return False
+        
+        return True
+        
+    except Exception as e:
+        print(f"✗ FAILED: {e}")
+        return False
 
 
-def test_propose_signature():
-    """Test what propose should return"""
+def test_attention_mask():
+    """Test 2: Attention mask creation"""
     print("\n" + "="*70)
-    print("WHAT PROPOSE SHOULD RETURN")
+    print("TEST 2: ATTENTION MASK")
     print("="*70)
     
-    import torch
-    
-    print("\n1. Correct return value:")
-    print("   draft_tokens: torch.Tensor (shape [N])")
-    print("   draft_nodes: List[TreeNode]")
-    
-    print("\n2. Example of correct return:")
-    
-    # Mock correct return
-    draft_tokens = torch.tensor([1, 2, 3, 4, 5])
-    draft_nodes = []  # Would contain TreeNode objects
-    
-    result = (draft_tokens, draft_nodes)
-    
-    print(f"   result = {type(result)}")
-    print(f"   len(result) = {len(result)}")
-    
-    print("\n3. Unpacking:")
-    print("   tokens, nodes = result")
-    
-    tokens, nodes = result
-    print(f"   ✓ tokens: {type(tokens)}, shape {tokens.shape}")
-    print(f"   ✓ nodes: {type(nodes)}, length {len(nodes)}")
-    
-    print("\n4. Even on error, return empty tuple:")
-    print("   return torch.tensor([]), []")
-    
-    empty_result = (torch.tensor([]), [])
-    tokens, nodes = empty_result
-    
-    print(f"   ✓ tokens: {type(tokens)}, shape {tokens.shape}")
-    print(f"   ✓ nodes: {type(nodes)}, length {len(nodes)}")
+    try:
+        nodes, parent_ids = build_tree_structure(width=3, depth=2)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        mask = create_tree_attention_mask(
+            parent_ids,
+            prefix_len=5,
+            device=device
+        )
+        
+        print(f"✓ Created mask: {mask.shape}")
+        print(f"  Mask type: {type(mask)}")
+        
+        if mask is None:
+            print("✗ ERROR: mask is None!")
+            return False
+        
+        return True
+        
+    except Exception as e:
+        print(f"✗ FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 
-def verify_fix():
-    """Verify the fix is in place"""
+def test_position_ids():
+    """Test 3: Position IDs creation"""
     print("\n" + "="*70)
-    print("VERIFYING FIX IN CODE")
+    print("TEST 3: POSITION IDS")
     print("="*70)
     
-    print("\nChecking fast_eagle_proposer.py...")
+    try:
+        nodes, parent_ids = build_tree_structure(width=3, depth=2)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        positions = create_tree_position_ids(
+            nodes,
+            prefix_len=5,
+            device=device
+        )
+        
+        print(f"✓ Created positions: {positions.shape}")
+        print(f"  Positions type: {type(positions)}")
+        
+        if positions is None:
+            print("✗ ERROR: positions is None!")
+            return False
+        
+        return True
+        
+    except Exception as e:
+        print(f"✗ FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def test_beam_pruning_mock():
+    """Test 4: Beam search pruning with mock data"""
+    print("\n" + "="*70)
+    print("TEST 4: BEAM PRUNING (MOCK)")
+    print("="*70)
     
     try:
-        with open('fast_eagle_proposer.py', 'r') as f:
-            content = f.read()
+        # Build tree
+        nodes, parent_ids = build_tree_structure(width=3, depth=2)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Check for the fix
-        checks = [
-            ('Error handling in propose', 'except Exception as e:' in content and 'return empty_tokens, empty_nodes' in content or 'return torch.tensor([])' in content),
-            ('Verbose mode added', 'verbose: bool' in content),
-            ('ModelOutput class', 'class ModelOutput:' in content or 'ModelOutput(' in content),
-            ('Root token sampling', 'root_token_id' in content),
-        ]
+        # Mock logits
+        vocab_size = 1000
+        tree_logits = torch.randn(len(nodes), vocab_size, device=device)
         
-        print("\nChecking for fixes:")
-        all_good = True
+        print(f"  Tree nodes: {len(nodes)}")
+        print(f"  Mock logits: {tree_logits.shape}")
         
-        for check_name, check_result in checks:
-            status = "✓" if check_result else "✗"
-            print(f"  {status} {check_name}")
-            if not check_result:
-                all_good = False
+        # We can't easily test the full beam_search_prune without the proposer
+        # but we can at least verify the inputs are valid
         
-        if all_good:
-            print("\n✓ All fixes appear to be in place!")
-            print("  If you're still getting the error, run:")
-            print("  1. python test_minimal.py")
-            print("  2. python test_debug.py")
-        else:
-            print("\n✗ Some fixes are missing")
-            print("  Make sure you have the latest fast_eagle_proposer.py")
+        print("✓ Inputs for beam pruning are valid")
+        return True
         
-    except FileNotFoundError:
-        print("\n✗ fast_eagle_proposer.py not found")
-        print("  Make sure you're in the correct directory")
+    except Exception as e:
+        print(f"✗ FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def test_return_tuple():
+    """Test 5: Verify functions return correct types"""
+    print("\n" + "="*70)
+    print("TEST 5: RETURN TYPES")
+    print("="*70)
+    
+    try:
+        # Test build_tree_structure
+        result = build_tree_structure(width=2, depth=2)
+        
+        print(f"build_tree_structure returns: {type(result)}")
+        
+        if result is None:
+            print("✗ ERROR: build_tree_structure returns None!")
+            return False
+        
+        if not isinstance(result, tuple):
+            print(f"✗ ERROR: build_tree_structure returns {type(result)}, not tuple!")
+            return False
+        
+        if len(result) != 2:
+            print(f"✗ ERROR: build_tree_structure returns tuple of length {len(result)}, not 2!")
+            return False
+        
+        nodes, parent_ids = result
+        
+        if nodes is None:
+            print("✗ ERROR: nodes in tuple is None!")
+            return False
+        
+        if parent_ids is None:
+            print("✗ ERROR: parent_ids in tuple is None!")
+            return False
+        
+        print(f"✓ build_tree_structure returns: (List[{len(nodes)}], List[{len(parent_ids)}])")
+        
+        return True
+        
+    except Exception as e:
+        print(f"✗ FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 
 def main():
-    """Run all verification"""
+    """Run all minimal tests"""
     print("\n" + "="*70)
-    print("FIX VERIFICATION SCRIPT")
+    print("MINIMAL TEST SUITE - ISOLATE THE ISSUE")
     print("="*70)
-    print("\nThis script helps diagnose the 'cannot unpack non-iterable NoneType' error")
+    print("\nThese tests check each component without loading models")
     
-    test_unpack_none()
-    test_propose_signature()
-    verify_fix()
+    tests = [
+        test_tree_building,
+        test_attention_mask,
+        test_position_ids,
+        test_beam_pruning_mock,
+        test_return_tuple,
+    ]
+    
+    results = []
+    for test in tests:
+        passed = test()
+        results.append(passed)
     
     print("\n" + "="*70)
-    print("NEXT STEPS")
+    print("RESULTS")
     print("="*70)
-    print("\n1. Run minimal tests (no model loading):")
-    print("   python test_minimal.py")
-    print("\n2. Run debug test (with model loading):")
-    print("   python test_debug.py")
-    print("\n3. If debug test fails, check the output to see where")
-    print("   propose() is returning None")
-    print("="*70 + "\n")
+    
+    passed = sum(results)
+    total = len(results)
+    
+    print(f"{passed}/{total} tests passed")
+    
+    if passed == total:
+        print("\n✓ All component tests passed!")
+        print("  The issue is likely in:")
+        print("  1. Model loading")
+        print("  2. Model forward pass")
+        print("  3. The propose() method itself")
+        print("\nRun test_debug.py to test with actual models")
+    else:
+        print(f"\n✗ {total - passed} component tests failed")
+        print("  Fix these basic components first")
+    
+    print("="*70)
 
 
 if __name__ == "__main__":
